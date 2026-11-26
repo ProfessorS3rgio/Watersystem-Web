@@ -1,0 +1,358 @@
+
+Enum "bill_status_enum" {
+  "Paid"
+  "Void"
+  "Pending"
+  "Due"
+}
+
+Enum "bill_transaction_type_enum" {
+  "payment"
+  "void"
+}
+
+Enum "bill_transaction_source_enum" {
+  "Office"
+  "Device"
+}
+
+Enum "customer_status_enum" {
+  "active"
+  "disconnected"
+}
+
+Enum "deduction_type_enum" {
+  "percentage"
+  "fixed"
+}
+
+Table "barangay_sequence" {
+  "brgy_id" bigint [pk, not null, increment]
+  "barangay" varchar(255) [not null]
+  "prefix" char(1) [not null]
+  "next_number" int [not null]
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" timestamp
+  "updated_at" timestamp [not null]
+
+  Indexes {
+    barangay [unique, name: "barangay_sequence_barangay_unique"]
+  }
+}
+
+Table "bill" {
+  "bill_id" bigint [pk, not null, increment]
+  "reference_number" varchar(255) [not null]
+  "customer_id" bigint [not null]
+  "customer_account_number" varchar(255) [not null]
+  "reading_id" bigint [not null]
+  "device_uid" varchar(255) [not null]
+  "bill_date" date [not null]
+  "rate_per_m3" decimal(10,2) [not null]
+  "charges" decimal(10,2) [not null]
+  "penalty" decimal(10,2) [not null]
+  "total_due" decimal(10,2) [not null]
+  "due_date" date
+  "status" bill_status_enum [not null, default: 'Pending']
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" datetime
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    reference_number [unique, name: "bill_reference_number_unique"]
+    reading_id [name: "bill_reading_id_foreign"]
+    device_uid [name: "bill_device_uid_foreign"]
+    customer_id [name: "bill_customer_id_index"]
+  }
+}
+
+Table "bill_deduction" {
+  "bill_deduction_id" bigint [pk, not null, increment]
+  "bill_id" bigint [not null]
+  "deduction_id" bigint [not null]
+  "amount" decimal(10,2) [not null]
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    bill_id [name: "bill_deduction_bill_id_foreign"]
+    deduction_id [name: "bill_deduction_deduction_id_foreign"]
+  }
+}
+
+Table "bill_transaction" {
+  "bill_transaction_id" bigint [pk, not null, increment]
+  "bill_reference_number" varchar(255) [not null]
+  "device_uid" varchar(255) [not null]
+  "type" bill_transaction_type_enum [not null]
+  "source" bill_transaction_source_enum [not null]
+  "amount" decimal(10,2) [not null]
+  "cash_received" decimal(10,2)
+  "change" decimal(10,2) [not null]
+  "transaction_date" datetime [not null]
+  "payment_method" varchar(255) [not null]
+  "processed_by_user_id" bigint
+  "processed_by_device_uid" varchar(255)
+  "notes" text
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" datetime
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    bill_reference_number [name: "bill_transaction_bill_reference_number_foreign"]
+    device_uid [name: "bill_transaction_device_uid_foreign"]
+    processed_by_device_uid [name: "bill_transaction_processed_by_device_uid_foreign"]
+    processed_by_user_id [name: "bill_transaction_processed_by_user_id_foreign"]
+  }
+}
+
+Table "cache" {
+  "key" varchar(255) [pk, not null]
+  "value" mediumtext [not null]
+  "expiration" int [not null]
+}
+
+Table "cache_locks" {
+  "key" varchar(255) [pk, not null]
+  "owner" varchar(255) [not null]
+  "expiration" int [not null]
+}
+
+Table "customer" {
+  "customer_id" bigint [pk, not null, increment]
+  "account_no" varchar(255) [not null]
+  "type_id" bigint [not null]
+  "customer_name" varchar(255) [not null]
+  "deduction_id" bigint
+  "brgy_id" bigint [not null]
+  "address" varchar(255) [not null]
+  "previous_reading" int [not null]
+  "status" customer_status_enum [not null, default: 'active']
+  "Synced" tinyint(1) [not null, default: '0']
+  "created_at" timestamp
+  "updated_at" timestamp
+  "last_sync" datetime
+
+  Indexes {
+    account_no [unique, name: "customer_account_no_unique"]
+    type_id [name: "customer_type_id_foreign"]
+    deduction_id [name: "customer_deduction_id_foreign"]
+    brgy_id [name: "customer_brgy_id_foreign"]
+  }
+}
+
+Table "customer_deduction" {
+  "customer_id" bigint [not null]
+  "deduction_id" bigint [not null]
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    (customer_id, deduction_id) [unique, name: "customer_deduction_customer_id_deduction_id_unique"]
+    deduction_id [name: "customer_deduction_deduction_id_foreign"]
+  }
+}
+
+Table "customer_type" {
+  "type_id" bigint [pk, not null, increment]
+  "type_name" varchar(255) [not null]
+  "rate_per_m3" decimal(10,2) [not null]
+  "min_m3" int [not null, default: '0']
+  "min_charge" decimal(10,2) [not null]
+  "penalty" decimal(10,2) [not null]
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" datetime
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    type_name [unique, name: "customer_type_type_name_unique"]
+  }
+}
+
+Table "deduction" {
+  "deduction_id" bigint [pk, not null, increment]
+  "name" varchar(255) [not null]
+  "type" deduction_type_enum [not null]
+  "value" decimal(10,2) [not null]
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" datetime
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    name [unique, name: "deduction_name_unique"]
+  }
+}
+
+Table "device" {
+  "brgy_id" bigint [not null]
+  "device_mac" varchar(255) [not null]
+  "device_uid" varchar(255) [not null]
+  "firmware_version" varchar(255) [not null]
+  "device_name" varchar(255)
+  "print_count" int [not null, default: '0']
+  "customer_count" int [not null, default: '0']
+  "last_sync" datetime
+  "Synced" tinyint(1) [not null, default: '0']
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    device_mac [unique, name: "device_device_mac_unique"]
+    device_uid [name: "device_device_uid_index"]
+    brgy_id [name: "device_brgy_id_foreign"]
+  }
+}
+
+Table "failed_jobs" {
+  "id" bigint [pk, not null, increment]
+  "uuid" varchar(255) [not null]
+  "connection" text [not null]
+  "queue" text [not null]
+  "payload" longtext [not null]
+  "exception" longtext [not null]
+  "failed_at" timestamp [not null, default: `CURRENT_TIMESTAMP`]
+
+  Indexes {
+    uuid [unique, name: "failed_jobs_uuid_unique"]
+  }
+}
+
+Table "job_batches" {
+  "id" varchar(255) [pk, not null]
+  "name" varchar(255) [not null]
+  "total_jobs" int [not null]
+  "pending_jobs" int [not null]
+  "failed_jobs" int [not null]
+  "failed_job_ids" longtext [not null]
+  "options" mediumtext
+  "cancelled_at" int
+  "created_at" int [not null]
+  "finished_at" int
+}
+
+Table "jobs" {
+  "id" bigint [pk, not null, increment]
+  "queue" varchar(255) [not null]
+  "payload" longtext [not null]
+  "attempts" tinyint [not null]
+  "reserved_at" int
+  "available_at" int [not null]
+  "created_at" int [not null]
+
+  Indexes {
+    queue [name: "jobs_queue_index"]
+  }
+}
+
+Table "migrations" {
+  "id" int [pk, not null, increment]
+  "migration" varchar(255) [not null]
+  "batch" int [not null]
+}
+
+Table "password_reset_tokens" {
+  "email" varchar(255) [pk, not null]
+  "token" varchar(255) [not null]
+  "created_at" timestamp
+}
+
+Table "reading" {
+  "reading_id" bigint [pk, not null, increment]
+  "customer_id" bigint [not null]
+  "customer_account_number" varchar(255) [not null]
+  "device_uid" varchar(255) [not null]
+  "previous_reading" int [not null]
+  "current_reading" int [not null]
+  "usage_m3" int [not null]
+  "reading_at" datetime [not null]
+  "read_by_user_id" bigint
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" datetime
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    customer_id [name: "reading_customer_id_foreign"]
+    device_uid [name: "reading_device_uid_foreign"]
+    read_by_user_id [name: "reading_read_by_user_id_foreign"]
+  }
+}
+
+Table "sessions" {
+  "id" varchar(255) [pk, not null]
+  "user_id" bigint
+  "ip_address" varchar(45)
+  "user_agent" text
+  "payload" longtext [not null]
+  "last_activity" int [not null]
+
+  Indexes {
+    user_id [name: "sessions_user_id_index"]
+    last_activity [name: "sessions_last_activity_index"]
+  }
+}
+
+Table "settings" {
+  "id" bigint [pk, not null, increment]
+  "bill_due_days" int [not null, default: '5']
+  "disconnection_days" int [not null, default: '8']
+  "Synced" tinyint(1) [not null, default: '0']
+  "last_sync" timestamp
+  "created_at" timestamp
+  "updated_at" timestamp
+}
+
+Table "users" {
+  "id" bigint [pk, not null, increment]
+  "name" varchar(255) [not null]
+  "email" varchar(255) [not null]
+  "email_verified_at" timestamp
+  "password" varchar(255) [not null]
+  "remember_token" varchar(100)
+  "created_at" timestamp
+  "updated_at" timestamp
+
+  Indexes {
+    email [unique, name: "users_email_unique"]
+  }
+}
+
+Ref "bill_customer_id_foreign":"customer"."customer_id" <? "bill"."customer_id"
+
+Ref "bill_device_uid_foreign":"device"."device_uid" <? "bill"."device_uid"
+
+Ref "bill_reading_id_foreign":"reading"."reading_id" <? "bill"."reading_id"
+
+Ref "bill_deduction_bill_id_foreign":"bill"."bill_id" <? "bill_deduction"."bill_id"
+
+Ref "bill_deduction_deduction_id_foreign":"deduction"."deduction_id" <? "bill_deduction"."deduction_id"
+
+Ref "bill_transaction_bill_reference_number_foreign":"bill"."reference_number" <? "bill_transaction"."bill_reference_number"
+
+Ref "bill_transaction_device_uid_foreign":"device"."device_uid" <? "bill_transaction"."device_uid"
+
+Ref "bill_transaction_processed_by_device_uid_foreign":"device"."device_uid" ?<? "bill_transaction"."processed_by_device_uid"
+
+Ref "bill_transaction_processed_by_user_id_foreign":"users"."id" ?<? "bill_transaction"."processed_by_user_id"
+
+Ref "customer_brgy_id_foreign":"barangay_sequence"."brgy_id" <? "customer"."brgy_id"
+
+Ref "customer_deduction_id_foreign":"deduction"."deduction_id" ?<? "customer"."deduction_id"
+
+Ref "customer_type_id_foreign":"customer_type"."type_id" <? "customer"."type_id"
+
+Ref "customer_deduction_customer_id_foreign":"customer"."customer_id" <? "customer_deduction"."customer_id"
+
+Ref "customer_deduction_deduction_id_foreign":"deduction"."deduction_id" <? "customer_deduction"."deduction_id"
+
+Ref "device_brgy_id_foreign":"barangay_sequence"."brgy_id" <? "device"."brgy_id"
+
+Ref "reading_customer_id_foreign":"customer"."customer_id" <? "reading"."customer_id"
+
+Ref "reading_device_uid_foreign":"device"."device_uid" <? "reading"."device_uid"
+
+Ref "reading_read_by_user_id_foreign":"users"."id" ?<? "reading"."read_by_user_id"
