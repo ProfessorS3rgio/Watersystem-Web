@@ -81,6 +81,8 @@ Route::middleware('auth')->group(function () {
     Route::get('/bills/monthly-collectable', [BillController::class, 'monthlyCollectable']);
     Route::get('/bills/stats', [BillController::class, 'stats']);
     Route::get('/bills/transactions', [BillController::class, 'transactions']);
+    Route::get('/devices/{deviceUid}/pending-office-payments', [BillController::class, 'pendingOfficePayments']);
+    Route::post('/devices/{deviceUid}/office-payments-synced', [BillController::class, 'markOfficePaymentsSynced']);
     Route::post('/bill-transactions/sync', [BillController::class, 'syncTransactions']);
     Route::post('/bill-transactions/mark-synced', [BillController::class, 'markTransactionsSynced']);
 

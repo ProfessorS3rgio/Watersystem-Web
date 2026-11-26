@@ -720,6 +720,8 @@ public function monthlyReport(Request $request)
                 'payment_method' => $validated['payment_method'],
                 'processed_by_user_id' => auth()->id(),
                 'notes' => 'Payment recorded via web system in the office.',
+                'Synced' => false,
+                'last_sync' => null,
             ]);
         });
 
@@ -837,6 +839,8 @@ public function monthlyReport(Request $request)
                 'payment_method' => 'cash',
                 'processed_by_user_id' => auth()->id(),
                 'notes' => 'Payment recorded via web system in the office.',
+                'Synced' => false,
+                'last_sync' => null,
             ]);
         });
 
@@ -885,6 +889,8 @@ public function monthlyReport(Request $request)
                 'payment_method' => 'adjustment',
                 'processed_by_user_id' => auth()->id(),
                 'notes' => $validated['reason'] ?? null,
+                'Synced' => false,
+                'last_sync' => null,
             ]);
         });
 
@@ -905,6 +911,68 @@ public function monthlyReport(Request $request)
         return response()->json([
             'data' => $transactions,
         ]);
+    }
+
+    /** Office-entered payment and void events not yet confirmed on their master. */
+    public function pendingOfficePayments(Request $request, string $deviceUid)
+    {
+        $includeBillAmounts = $request->boolean('bill_amounts');
+        $payments = BillTransaction::with('bill')
+            ->where('device_uid', $deviceUid)
+            ->where('source', 'Office')
+            ->when(!($includeBillAmounts && $request->boolean('resend')), fn ($query) => $query->where('Synced', false))
+            ->whereIn('type', ['payment', 'void'])
+            ->orderBy('transaction_date')
+            ->orderBy('bill_transaction_id')
+            ->get()
+            ->filter(fn ($transaction) => $transaction->bill !== null)
+            ->map(function ($transaction) use ($includeBillAmounts) {
+                $bill = $transaction->bill;
+                return [
+                    'web_transaction_id' => (int) $transaction->bill_transaction_id,
+                    'bill_reference_number' => $transaction->bill_reference_number,
+                    'type' => $transaction->type,
+                    'amount' => (float) $transaction->amount,
+                    'cash_received' => (float) ($transaction->cash_received ?? 0),
+                    'change' => (float) ($transaction->change ?? 0),
+                    'transaction_date' => $transaction->transaction_date?->format('Y-m-d H:i:s') ?? $transaction->created_at?->format('Y-m-d H:i:s'),
+                    'payment_method' => $transaction->payment_method,
+                    'notes' => mb_substr((string) ($transaction->notes ?? ''), 0, 1000),
+                    // Send the canonical balance snapshot so partial payments
+                    // and voids leave the master identical to the website.
+                    'bill_amount_paid' => (float) ($bill->amount_paid ?? 0),
+                    'bill_balance_due' => (float) ($bill->balance_due ?? max(0, (float) $bill->total_due - (float) ($bill->amount_paid ?? 0))),
+                    'bill_status' => (string) $bill->status,
+                ] + ($includeBillAmounts ? [
+                    'bill_charges' => (float) $bill->charges,
+                    'bill_penalty' => (float) $bill->penalty,
+                    'bill_total_due' => (float) $bill->total_due,
+                ] : []);
+            })->values();
+
+        return response()->json(['payments' => $payments]);
+    }
+
+    /** Mark only the office events confirmed by the matching master as delivered. */
+    public function markOfficePaymentsSynced(Request $request, string $deviceUid)
+    {
+        $validated = $request->validate([
+            'bill_transaction_ids' => ['required', 'array', 'max:5000'],
+            'bill_transaction_ids.*' => ['required', 'integer', 'min:1'],
+        ]);
+
+        $updated = BillTransaction::whereIn('bill_transaction_id', $validated['bill_transaction_ids'])
+            ->where('device_uid', $deviceUid)
+            ->where('source', 'Office')
+            ->whereIn('type', ['payment', 'void'])
+            ->where('Synced', false)
+            ->update([
+                'Synced' => true,
+                'processed_by_device_uid' => $deviceUid,
+                'last_sync' => now(),
+            ]);
+
+        return response()->json(['updated' => $updated]);
     }
 
     public function getPayment(Request $request, Bill $bill)

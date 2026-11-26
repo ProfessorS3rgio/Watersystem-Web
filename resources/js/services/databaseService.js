@@ -112,6 +112,24 @@ export const databaseService = {
     return json?.data || {}
   },
 
+  async fetchPendingOfficePayments(deviceUid, billAmounts, resend) {
+    const uid = encodeURIComponent(String(deviceUid || '').trim())
+    if (!uid) throw new Error('The connected master has no device UID')
+    const res = await window.axios.get(`/devices/${uid}/pending-office-payments`, {
+      params: { bill_amounts: billAmounts ? 1 : 0, resend: resend ? 1 : 0 },
+    })
+    return Array.isArray(res.data?.payments) ? res.data.payments : []
+  },
+
+  async markOfficePaymentsSynced(deviceUid, billTransactionIds) {
+    const uid = encodeURIComponent(String(deviceUid || '').trim())
+    if (!uid) throw new Error('The connected master has no device UID')
+    const res = await window.axios.post(`/devices/${uid}/office-payments-synced`, {
+      bill_transaction_ids: billTransactionIds,
+    })
+    return Number(res.data?.updated || 0)
+  },
+
   async upsertCustomersToDatabase(customers) {
     try {
       const res = await window.axios.post('/customers/sync', { customers })

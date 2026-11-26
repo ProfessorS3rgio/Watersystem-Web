@@ -26,6 +26,7 @@ class SyncVerificationService
             'bills.*.penalty' => 'required|numeric', 'bills.*.total_due' => 'required|numeric', 'bills.*.status' => 'required|string|max:30',
             'transactions.*.bill_transaction_id' => 'required|integer|min:1', 'transactions.*.bill_reference_number' => 'required|string|max:100',
             'transactions.*.processed_by_device_uid' => 'nullable|string|max:100',
+            'transactions.*.web_transaction_id' => 'nullable|integer|min:1',
             'transactions.*.type' => 'required|string|max:30', 'transactions.*.source' => 'required|string|max:30',
             'transactions.*.amount' => 'required|numeric', 'transactions.*.cash_received' => 'nullable|numeric',
             'transactions.*.change' => 'required|numeric', 'transactions.*.transaction_date' => 'required|string|max:30',
@@ -62,6 +63,7 @@ class SyncVerificationService
         foreach ($queries as $key => $query) $state[$key] = ($lock ? $query->lockForUpdate() : $query)->get();
         $customers = $state['customers']->keyBy('account_no');
         $readings = $state['readings']; $bills = $state['bills']->keyBy('reference_number'); $transactions = $state['transactions'];
+        $pendingOfficeRefs = $transactions->filter(fn ($transaction) => $transaction->source === 'Office' && !(bool) $transaction->Synced)->pluck('bill_reference_number')->flip();
         $rows = []; $seen = []; $readingMap = []; $billMap = [];
         $add = function (string $kind, array $raw, string $key, string $label) use (&$rows, &$seen) {
             $index = count($rows);
@@ -150,6 +152,7 @@ class SyncVerificationService
                 if ($existing->customer_account_number !== $raw['customer_account_number'] || $existing->device_uid !== $uid || !$expectedReadingId || (int) $existing->reading_id !== (int) $expectedReadingId || substr($existing->bill_date, 0, 10) !== $raw['bill_date']) $rows[$i]['issues'][] = 'Bill reference is already linked to different records.';
                 foreach (['rate_per_m3', 'charges', 'penalty', 'total_due'] as $field) if ($this->cents($existing->$field) !== $this->cents($raw[$field])) $rows[$i]['issues'][] = "Existing bill has a different {$field}.";
                 if ($existing->status === $raw['status'] || ($existing->status === 'Due' && $raw['status'] === 'Pending')) $rows[$i]['status'] = 'already_saved';
+                elseif ($pendingOfficeRefs->has($raw['reference_number'])) $rows[$i]['status'] = 'already_saved';
                 elseif (!in_array($raw['status'], ['Paid', 'Partially Paid'], true) || in_array($existing->status, ['Paid', 'Void'], true)) $rows[$i]['issues'][] = 'Bill status conflicts with the website. Resolve it before syncing.';
             } else {
                 $period = $raw['customer_account_number'].':'.substr($raw['bill_date'], 0, 7);
@@ -173,7 +176,8 @@ class SyncVerificationService
             if (($raw['processed_by_device_uid'] ?? $uid) !== $uid) $rows[$i]['issues'][] = 'Payment belongs to another device.';
             if (!$this->date($raw['transaction_date'], 'Y-m-d H:i:s')) $rows[$i]['issues'][] = 'Invalid payment date.';
             elseif ($raw['transaction_date'] < '2020-01-01 00:00:00' || Carbon::parse($raw['transaction_date'], 'Asia/Manila')->timestamp > now()->addDay()->timestamp) $rows[$i]['issues'][] = 'Payment date is outside the valid device clock range.';
-            if (!in_array($raw['type'], ['payment', 'void'], true) || $raw['source'] !== 'Device') $rows[$i]['issues'][] = 'Unsupported transaction type or source.';
+            $webOrigin = !empty($raw['web_transaction_id']);
+            if (!in_array($raw['type'], ['payment', 'void'], true) || ($raw['source'] !== 'Device' && !($raw['source'] === 'Office' && $webOrigin))) $rows[$i]['issues'][] = 'Unsupported transaction type or source.';
             if ($raw['type'] === 'payment' && isset($raw['cash_received']) && $this->cents($raw['cash_received']) - $this->cents($raw['change']) !== $this->cents($raw['amount'])) $rows[$i]['issues'][] = 'Cash received minus change does not equal the payment.';
             $ref = $raw['bill_reference_number']; $bill = $bills->get($ref); $billIndex = $billMap[$ref] ?? null;
             $rows[$i]['account'] = $billIndex !== null ? $rows[$billIndex]['account'] : ($bill?->customer_account_number ?? '');
@@ -183,16 +187,22 @@ class SyncVerificationService
             if (!$bill && $billIndex === null) $rows[$i]['issues'][] = 'Referenced bill was not found in the website or this batch.';
             if ($customer && (int) $customer->brgy_id !== (int) $payload['device']['brgy_id']) $rows[$i]['issues'][] = 'Payment customer belongs to another barangay.';
             if ($bill && $bill->device_uid !== $uid) $rows[$i]['issues'][] = 'Referenced bill belongs to another device.';
-            $identity = $transactions->first(fn ($t) => $t->processed_by_device_uid === $uid && (int) $t->device_transaction_id === (int) $raw['bill_transaction_id']);
+            $webIdentity = $webOrigin ? $transactions->first(fn ($t) => (int) $t->bill_transaction_id === (int) $raw['web_transaction_id'] && $t->device_uid === $uid && $t->source === 'Office') : null;
+            $deviceIdentity = $transactions->first(fn ($t) => $t->processed_by_device_uid === $uid && (int) $t->device_transaction_id === (int) $raw['bill_transaction_id']);
+            if ($webOrigin && !$webIdentity) $rows[$i]['issues'][] = 'This website payment identity is missing or linked to another master.';
+            $identity = $webIdentity ?? $deviceIdentity;
             $legacy = $transactions->filter(fn ($t) => $t->bill_reference_number === $ref && $t->transaction_date === $raw['transaction_date'] && $this->cents($t->amount) === $this->cents($raw['amount']));
             $existing = $identity ?? ($legacy->count() === 1 ? $legacy->first() : null);
             if ($legacy->count() > 1 && !$identity) $rows[$i]['issues'][] = 'Several existing transactions match this payment.';
             if ($existing) {
                 $rows[$i]['existing_id'] = $existing->bill_transaction_id;
-                $same = $existing->bill_reference_number === $ref && $existing->transaction_date === $raw['transaction_date'] && $existing->type === $raw['type'] && $existing->source === $raw['source'] && $existing->processed_by_device_uid === $uid && $existing->payment_method === $raw['payment_method'] && (string) $existing->notes === (string) ($raw['notes'] ?? '');
+                $sameSource = $webOrigin
+                    ? ($existing->source === 'Office' && (int) $existing->bill_transaction_id === (int) $raw['web_transaction_id'])
+                    : ($existing->source === 'Device' && $existing->processed_by_device_uid === $uid);
+                $same = $existing->bill_reference_number === $ref && $existing->transaction_date === $raw['transaction_date'] && $existing->type === $raw['type'] && $sameSource && $existing->payment_method === $raw['payment_method'] && ($webOrigin || (string) $existing->notes === (string) ($raw['notes'] ?? ''));
                 foreach (['amount', 'cash_received', 'change'] as $field) if ($this->cents($existing->$field) !== $this->cents($raw[$field] ?? 0)) $same = false;
                 if (!$same) $rows[$i]['issues'][] = 'Existing transaction has different values. It will not be overwritten.';
-                elseif ($existing->device_transaction_id) $rows[$i]['status'] = 'already_saved';
+                elseif ($webOrigin || $existing->device_transaction_id) $rows[$i]['status'] = 'already_saved';
                 else $rows[$i]['warnings'][] = 'Existing historical transaction will be linked to this device ID.';
             } elseif ($raw['type'] === 'payment') {
                 if ($bill && $bill->status === 'Paid') {
@@ -271,9 +281,13 @@ class SyncVerificationService
             $bill->Synced = true; $bill->last_sync = now(); $bill->save(); $billRefs[$raw['reference_number']] = true;
         }
         foreach ($plan['rows'] as $row) {
-            if ($row['kind'] !== 'payment' || $row['status'] === 'already_saved') continue;
+            if ($row['kind'] !== 'payment') continue;
             $raw = $row['incoming'];
-            if ($row['existing_id']) DB::table('bill_transaction')->where('bill_transaction_id', $row['existing_id'])->update(['device_transaction_id' => $raw['bill_transaction_id']]);
+            if ($row['existing_id']) {
+                DB::table('bill_transaction')->where('bill_transaction_id', $row['existing_id'])->update(['device_transaction_id' => $raw['bill_transaction_id']]);
+                continue;
+            }
+            if ($row['status'] === 'already_saved') continue;
             else {
                 $bill = Bill::where('reference_number', $raw['bill_reference_number'])->firstOrFail();
                 $transaction = new BillTransaction();

@@ -9,7 +9,7 @@
         <RouterLink to="/sync/normalize-dates" class="flex-1 min-w-36 rounded-xl px-4 py-3 text-center text-sm font-bold" :class="$route.path === '/sync/normalize-dates' ? 'bg-teal-700 text-white' : 'sync-muted hover:bg-teal-500/10'">Date normalization</RouterLink>
       </nav>
       <template v-if="activeWorkspace === 'sync' && $route.path !== '/sync/normalize-dates'">
-        <div class="grid gap-4 md:grid-cols-2"><section class="sync-panel p-6"><p class="text-xs font-bold uppercase tracking-wider text-cyan-600">Device → Website</p><h2 class="mt-3 text-lg font-bold">Readings, bills &amp; payments</h2><p class="mt-2 text-sm leading-6 sync-muted">Import field activity so office accounts reflect the latest device records.</p></section><section class="sync-panel p-6"><p class="text-xs font-bold uppercase tracking-wider text-teal-600">Website → Device</p><h2 class="mt-3 text-lg font-bold">Members, rates &amp; reference data</h2><p class="mt-2 text-sm leading-6 sync-muted">Send account changes and billing settings to the field device. Each sync creates a web restore point before transferring data.</p></section></div>
+        <div class="grid gap-4 md:grid-cols-2"><section class="sync-panel p-6"><p class="text-xs font-bold uppercase tracking-wider text-cyan-600">Device → Website</p><h2 class="mt-3 text-lg font-bold">Readings, bills &amp; payments</h2><p class="mt-2 text-sm leading-6 sync-muted">Import field activity so office accounts reflect the latest device records.</p></section><section class="sync-panel p-6"><p class="text-xs font-bold uppercase tracking-wider text-teal-600">Website → Device</p><h2 class="mt-3 text-lg font-bold">Members, reference data &amp; office payments</h2><p class="mt-2 text-sm leading-6 sync-muted">Send account changes, billing settings, and office payment or void updates to the matching master. Each sync creates a web restore point before transferring data.</p></section></div>
         <SyncDeviceInfo :connected="isConnected" :details="deviceDetails" />
       </template>
     <div v-if="$route.path === '/sync/normalize-dates'" class="sync-panel mb-6 overflow-hidden" :class="isDark ? 'border-gray-700 bg-gray-800' : 'border-teal-100 bg-white'">
@@ -208,6 +208,7 @@ import { useSyncSettings } from '../composables/Sync/useSyncSettings'
 import { useSyncReadings } from '../composables/Sync/useSyncReadings'
 import { useSyncBills } from '../composables/Sync/useSyncBills'
 import { useSyncBillTransactions } from '../composables/Sync/useSyncBillTransactions'
+import { useSyncOfficePayments } from '../composables/Sync/useSyncOfficePayments'
 import { useSyncData } from '../composables/Sync/useSyncData'
 import { useSyncController } from '../composables/Sync/useSyncController'
 
@@ -283,6 +284,8 @@ export default {
       handleAck: handleAckBillTransactions
     } = useSyncBillTransactions()
 
+    const { pushOfficePaymentsToDevice } = useSyncOfficePayments()
+
     const {
       isSyncing,
       syncStage,
@@ -332,6 +335,7 @@ export default {
       handleDeviceLineDevice,
       sendLineDevice,
       pushCustomersToDevice,
+      pushOfficePaymentsToDevice,
       handleChunkAck,
       pushCustomerTypesToDevice,
       pushDeductionsToDevice,
@@ -620,10 +624,11 @@ export default {
       this.addLog('Device disconnected')
     },
 
-    async handleSyncData() {
+    async handleSyncData(resendOfficePayments = false) {
       if (this.deviceBusy) return
       await this.syncData({
         isConnected: this.isConnected,
+        resendOfficePayments,
         exportDeviceInfoFromDevice: this.exportDeviceInfoFromDevice,
         pushCustomerTypesToDevice: this.pushCustomerTypesToDevice,
         pushDeductionsToDevice: this.pushDeductionsToDevice,
@@ -634,6 +639,7 @@ export default {
         reviewIncomingBatch: this.reviewIncomingBatch,
         exportBillTransactionsFromDevice: this.exportBillTransactionsFromDevice,
         pushCustomersToDevice: this.pushCustomersToDevice,
+        pushOfficePaymentsToDevice: this.pushOfficePaymentsToDevice,
         refreshDeviceInfo: this.refreshDeviceInfo,
         sendLineDevice: this.sendLineDevice,
         onSyncSuccess: () => {

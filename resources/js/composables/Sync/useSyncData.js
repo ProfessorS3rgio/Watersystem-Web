@@ -51,6 +51,7 @@ export function useSyncData() {
 
   const syncData = async ({
     isConnected,
+    resendOfficePayments = false,
     exportDeviceInfoFromDevice,
     pushCustomerTypesToDevice,
     pushDeductionsToDevice,
@@ -61,6 +62,7 @@ export function useSyncData() {
     exportBillTransactionsFromDevice,
     reviewIncomingBatch,
     pushCustomersToDevice,
+    pushOfficePaymentsToDevice,
     refreshDeviceInfo,
     sendLineDevice,
     onSyncSuccess
@@ -92,6 +94,10 @@ export function useSyncData() {
       // Get device info first to know which barangay this device belongs to
       addLog('Getting device information...')
       const deviceInfo = await exportDeviceInfoFromDevice()
+      const billAmounts = Number(deviceInfo.office_payment_bill_amounts) === 1
+      if (resendOfficePayments && !billAmounts) {
+        throw new Error('Update the master firmware before resending synced office payments.')
+      }
       const deviceBrgyId = deviceInfo?.brgy_id || 1
       const deviceId = deviceInfo?.device_id || 1
       const lastSyncEpoch = deviceInfo?.last_sync_epoch || 0
@@ -276,6 +282,28 @@ export function useSyncData() {
         const accountNumbers = pendingCustomers.map(c => c.account_no)
         await databaseService.markCustomersSynced(accountNumbers)
         addLog(`✓ Marked ${accountNumbers.length} customers as synced`)
+      }
+
+      // Office payment and void transactions are the web-to-master ledger feed.
+      // Only mark them delivered after the master commits and ACKs each chunk.
+      addLog('Checking for website payment updates...')
+      const pendingOfficePayments = await databaseService.fetchPendingOfficePayments(
+        deviceInfo.device_uid,
+        billAmounts,
+        resendOfficePayments,
+      )
+      if (pendingOfficePayments.length > 0) {
+        addLog(`Sending ${pendingOfficePayments.length} office payment update(s) to the master...`)
+        await pushOfficePaymentsToDevice(pendingOfficePayments)
+        for (let offset = 0; offset < pendingOfficePayments.length; offset += 5000) {
+          await databaseService.markOfficePaymentsSynced(
+            deviceInfo.device_uid,
+            pendingOfficePayments.slice(offset, offset + 5000).map(payment => payment.web_transaction_id),
+          )
+        }
+        addLog(`✓ Master confirmed ${pendingOfficePayments.length} office payment update(s)`)
+      } else {
+        addLog('No pending website payment updates for this master.')
       }
 
       // Always update last sync on the device at the end of a successful run.
