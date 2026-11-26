@@ -1,0 +1,244 @@
+import { createWifiTransport } from './wifiTransport.js';
+import { createDesktopSerial, isDesktop } from './desktopSerial.js';
+
+let port = null;
+let reader = null;
+let writer = null;
+let textDecoder = null;
+let textEncoder = null;
+let isConnected = false;
+let isReading = false;
+let rxBuffer = '';
+let transportMode = globalThis.localStorage?.getItem('dmbc-sync-transport') === 'wifi' ? 'wifi' : 'usb';
+let disconnectListenerInstalled = false;
+const wifi = createWifiTransport({ receive: handleChunk, statusChanged: emitStatus });
+const desktop = createDesktopSerial({ receive: handleChunk, statusChanged: emitStatus });
+
+const lineListeners = new Set();
+const statusListeners = new Set();
+
+function emitStatus() {
+  const snapshot = getState();
+  for (const cb of statusListeners) cb(snapshot);
+}
+
+function emitLine(line) {
+  for (const cb of lineListeners) cb(line);
+}
+
+function getConnectedPortLabel() {
+  if (!port) return '';
+  try {
+    const info = typeof port.getInfo === 'function' ? port.getInfo() : null;
+    if (info && (info.usbVendorId || info.usbProductId)) {
+      const vid = info.usbVendorId ? info.usbVendorId.toString(16).padStart(4, '0') : '----';
+      const pid = info.usbProductId ? info.usbProductId.toString(16).padStart(4, '0') : '----';
+      return `USB ${vid}:${pid} (Web Serial)`;
+    }
+  } catch (_) {
+    // ignore
+  }
+  return 'Serial Port (Web Serial)';
+}
+
+function handleChunk(chunk) {
+  rxBuffer += chunk;
+  const lines = rxBuffer.split(/\r\n|\n|\r/);
+  rxBuffer = lines.pop() ?? '';
+
+  for (const line of lines) {
+    const trimmed = line.trimEnd();
+    if (trimmed.length > 0) emitLine(trimmed);
+  }
+
+  // NOTE:
+  // Do NOT aggressively flush partial lines.
+  // Large JSON exports are sent as a single newline-terminated line; flushing early
+  // splits JSON and breaks parsing on the client.
+  // If a device truly prints without newlines, this buffer will grow, but our ESP32
+  // protocol uses '\n' for all messages.
+}
+
+async function startReadLoop() {
+  if (!reader || isReading) return;
+  isReading = true;
+
+  try {
+    while (reader && isConnected) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        const chunk = textDecoder ? textDecoder.decode(value, { stream: true }) : new TextDecoder().decode(value);
+        if (chunk.length > 0) handleChunk(chunk);
+      }
+    }
+  } catch (e) {
+    emitLine(`Read stopped: ${e?.message || String(e)}`);
+  } finally {
+    isReading = false;
+  }
+}
+
+async function ensureStreams() {
+  if (!port) throw new Error('No serial port selected');
+  if (!port.readable || !port.writable) {
+    throw new Error('Serial port is not readable/writable');
+  }
+
+  textDecoder = new TextDecoder();
+  textEncoder = new TextEncoder();
+
+  if (!reader) reader = port.readable.getReader();
+  if (!writer) writer = port.writable.getWriter();
+}
+
+async function connect({ baudRate = 115200 } = {}) {
+  if (wifi.connected) throw new Error('Disconnect Wi-Fi before switching to USB.');
+  transportMode = 'usb';
+  globalThis.localStorage?.setItem('dmbc-sync-transport', 'usb');
+  if (isDesktop()) { rxBuffer = ''; await desktop.connect({ baudRate }); return; }
+  if (!('serial' in navigator)) {
+    throw new Error('Web Serial API not supported (use Chrome/Edge)');
+  }
+
+  if (port && isConnected) {
+    emitStatus();
+    return;
+  }
+
+  port = await navigator.serial.requestPort();
+  await port.open({ baudRate });
+
+  isConnected = true;
+  rxBuffer = '';
+  reader = null;
+  writer = null;
+
+  await ensureStreams();
+  emitStatus();
+  void startReadLoop();
+}
+
+async function autoReconnect({ baudRate = 115200 } = {}) {
+  if (transportMode === 'wifi') return wifi.connected;
+  if (isDesktop()) return desktop.connected;
+  if (!('serial' in navigator)) return false;
+  if (isConnected && port) return true;
+
+  const ports = await navigator.serial.getPorts();
+  if (!ports || ports.length === 0) return false;
+
+  port = ports[0];
+  await port.open({ baudRate });
+
+  isConnected = true;
+  rxBuffer = '';
+  reader = null;
+  writer = null;
+
+  await ensureStreams();
+  emitStatus();
+  void startReadLoop();
+  return true;
+}
+
+async function disconnect() {
+  if (transportMode === 'wifi') { await wifi.disconnect(); rxBuffer = ''; return; }
+  if (isDesktop()) { await desktop.disconnect(); rxBuffer = ''; return; }
+  isConnected = false;
+  emitStatus();
+
+  try {
+    if (reader) {
+      await reader.cancel();
+      reader.releaseLock();
+    }
+  } catch (_) {}
+
+  try {
+    if (writer) {
+      await writer.close();
+      writer.releaseLock();
+    }
+  } catch (_) {}
+
+  try {
+    if (port) {
+      await port.close();
+    }
+  } catch (_) {}
+
+  port = null;
+  reader = null;
+  writer = null;
+  textDecoder = null;
+  textEncoder = null;
+  rxBuffer = '';
+}
+
+async function sendLine(line) {
+  if (transportMode === 'wifi') return wifi.sendLine(String(line).replace(/\r|\n/g, ''));
+  if (isDesktop()) return desktop.sendLine(String(line).replace(/\r|\n/g, ''));
+  if (!writer) throw new Error('Serial writer not available');
+  const text = String(line).replace(/\r|\n/g, '');
+  const payload = textEncoder ? textEncoder.encode(text + '\n') : new TextEncoder().encode(text + '\n');
+  await writer.write(payload);
+}
+
+function onLine(cb) {
+  lineListeners.add(cb);
+  return () => lineListeners.delete(cb);
+}
+
+function onStatus(cb) {
+  statusListeners.add(cb);
+  cb(getState());
+  return () => statusListeners.delete(cb);
+}
+
+function getState() {
+  if (transportMode === 'wifi') return { isConnected: wifi.connected, transport: 'wifi', port: null, reader: null, writer: wifi.connected ? { transport: 'wifi' } : null, connectedPortLabel: wifi.connected ? wifi.label : '' };
+  if (isDesktop()) return { isConnected: desktop.connected, transport: 'usb', port: null, reader: null, writer: desktop.connected ? { transport: 'desktop' } : null, connectedPortLabel: desktop.label };
+  return {
+    transport: 'usb',
+    isConnected,
+    port,
+    reader,
+    writer,
+    connectedPortLabel: getConnectedPortLabel(),
+  };
+}
+
+function installSerialDisconnectListener() {
+  if (disconnectListenerInstalled || !('serial' in navigator)) return;
+  disconnectListenerInstalled = true;
+
+  navigator.serial.addEventListener('disconnect', (event) => {
+    const disconnectedPort = event && (event.port || event.target);
+    if (port && disconnectedPort === port) {
+      emitLine('Device disconnected (USB removed)');
+      void disconnect();
+    }
+  });
+}
+
+async function connectWifi(token) {
+  if (isConnected || desktop.connected) throw new Error('Disconnect USB before switching to Wi-Fi.');
+  transportMode = 'wifi';
+  globalThis.localStorage?.setItem('dmbc-sync-transport', 'wifi');
+  rxBuffer = '';
+  await wifi.connect(token);
+}
+
+// Existing sync handlers use this facade for either connection type.
+export const serialService = {
+  connectWifi,
+  connect,
+  autoReconnect,
+  disconnect,
+  sendLine,
+  onLine,
+  onStatus,
+  getState,
+  installSerialDisconnectListener,
+};

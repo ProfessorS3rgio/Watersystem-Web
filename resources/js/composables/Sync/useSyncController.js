@@ -1,0 +1,175 @@
+import { ref } from 'vue'
+import { serialService } from '../../services/serialService'
+
+export function useSyncController() {
+  const customCommand = ref('')
+  const isFormatting = ref(false)
+  const isRestarting = ref(false)
+  const isResetting = ref(false)
+  const showFormatConfirm = ref(false)
+  const showRestartConfirm = ref(false)
+  const showDropConfirm = ref(false)
+  const showResetConfirm = ref(false)
+  const showCommandSuccess = ref(false)
+  const commandSuccessMessage = ref('')
+
+  const sendCommand = async (command, addLog) => {
+    const st = serialService.getState()
+    if (!st.writer) {
+      addLog('Not connected. Connect a device first.')
+      return
+    }
+
+    try {
+      await serialService.sendLine(command)
+      addLog('Web → ' + command)
+    } catch (error) {
+      addLog('Write failed: ' + error.message)
+    }
+  }
+
+  const sendCustomCommand = async (addLog) => {
+    if (!customCommand.value.trim()) {
+      addLog('Please enter a command')
+      return
+    }
+
+    await sendCommand(customCommand.value.trim(), addLog)
+    customCommand.value = '' // Clear the input after sending
+  }
+
+  const formatSdCard = async (addLog, sendLineDevice) => {
+    const st = serialService.getState()
+    if (!st.writer) {
+      addLog('Not connected. Connect a device first.')
+      showFormatConfirm.value = false
+      return
+    }
+
+    isFormatting.value = true
+    try {
+      addLog('Formatting SD card...')
+      await sendLineDevice('FORMAT_SD')
+
+      // Wait for acknowledgment
+      await new Promise(resolve => setTimeout(resolve, 2000))
+
+      commandSuccessMessage.value = 'Format command sent. Review the activity log for the device response before using the SD card again.'
+      showCommandSuccess.value = true
+      addLog('Format command sent; check the device response for completion.')
+    } catch (error) {
+      addLog('Format failed: ' + (error?.message || String(error)))
+    } finally {
+      isFormatting.value = false
+      showFormatConfirm.value = false
+    }
+  }
+
+  const restartDevice = async (addLog, sendLineDevice, disconnectDevice) => {
+    const st = serialService.getState()
+    if (!st.writer) {
+      addLog('Not connected. Connect a device first.')
+      showRestartConfirm.value = false
+      return
+    }
+
+    isRestarting.value = true
+    try {
+      addLog('Restarting device...')
+      await sendLineDevice('RESTART_DEVICE')
+
+      // Wait a moment for the command to be sent
+      await new Promise(resolve => setTimeout(resolve, 500))
+
+      commandSuccessMessage.value = 'Device restart command sent. The device will restart momentarily.'
+      showCommandSuccess.value = true
+      addLog('✓ Restart command sent')
+
+      // Disconnect after restart command
+      setTimeout(() => {
+        disconnectDevice()
+      }, 1000)
+    } catch (error) {
+      addLog('Restart failed: ' + (error?.message || String(error)))
+    } finally {
+      isRestarting.value = false
+      showRestartConfirm.value = false
+    }
+  }
+
+  const dropDatabase = async (addLog, sendLineDevice) => {
+    const st = serialService.getState()
+    if (!st.writer) {
+      addLog('Not connected. Connect a device first.')
+      return
+    }
+
+    try {
+      addLog('Dropping database...')
+      await sendLineDevice('DROP_DB')
+
+      // Wait for acknowledgment
+      await new Promise(resolve => setTimeout(resolve, 2000))
+
+      commandSuccessMessage.value = 'Database has been dropped and reinitialized successfully.'
+      showCommandSuccess.value = true
+      addLog('✓ Database dropped successfully')
+    } catch (error) {
+      addLog('Drop database failed: ' + (error?.message || String(error)))
+    }
+  }
+
+  const resetSyncStatus = async (addLog) => {
+    if (isResetting.value) return
+    isResetting.value = true
+    try {
+      addLog('Resetting sync status...')
+      
+      const response = await fetch('/sync/reset-status', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || ''
+        },
+        credentials: 'same-origin'
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+      }
+
+      const result = await response.json()
+      
+      commandSuccessMessage.value = `Sync status has been reset successfully. ${result.total_reset} records updated.`
+      showCommandSuccess.value = true
+      addLog(`✓ Sync status reset successfully - ${result.total_reset} records updated`)
+    } catch (error) {
+      addLog('Reset sync status failed: ' + (error?.message || String(error)))
+    } finally {
+      isResetting.value = false
+      showResetConfirm.value = false
+    }
+  }
+
+  return {
+    // Reactive state
+    customCommand,
+    isFormatting,
+    isRestarting,
+    isResetting,
+    showFormatConfirm,
+    showRestartConfirm,
+    showDropConfirm,
+    showResetConfirm,
+    showCommandSuccess,
+    commandSuccessMessage,
+
+    // Methods
+    sendCommand,
+    sendCustomCommand,
+    formatSdCard,
+    restartDevice,
+    dropDatabase,
+    resetSyncStatus
+  }
+}

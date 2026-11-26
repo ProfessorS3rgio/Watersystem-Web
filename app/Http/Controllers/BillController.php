@@ -1,0 +1,1009 @@
+<?php
+
+namespace App\Http\Controllers;
+use App\Models\Reading;
+use App\Models\Bill;
+use App\Models\Setting;
+use App\Models\Customer;
+use App\Models\BillTransaction;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use App\Services\AuditLogService;
+use App\Services\BillingStatusService;
+use App\Services\ReceiptService;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Style\Alignment;
+use PhpOffice\PhpSpreadsheet\Style\Border;
+use PhpOffice\PhpSpreadsheet\Style\Fill;
+use PhpOffice\PhpSpreadsheet\Style\Font;
+use PhpOffice\PhpSpreadsheet\Style\NumberFormat;
+use PhpOffice\PhpSpreadsheet\Style\Color;
+
+
+class BillController extends Controller
+{
+    public function index(Request $request)
+    {
+        $status = $request->query('status');
+        $customerId = $request->query('customer_id');
+        $customerSearch = $request->query('customer_search');
+
+        $query = Bill::with('customer');
+
+        if ($status) {
+            $query->whereRaw('LOWER(status) = ?', [strtolower($status)]);
+        }
+
+        if ($customerId) {
+            $query->where('customer_id', $customerId);
+        }
+
+        if ($customerSearch) {
+            $query->where(function ($search) use ($customerSearch) {
+                $search->where('reference_number', 'like', '%' . $customerSearch . '%')
+                    ->orWhereHas('customer', function ($customer) use ($customerSearch) {
+                        $customer->where(function ($fields) use ($customerSearch) {
+                            $fields->where('customer_name', 'like', '%' . $customerSearch . '%')
+                                ->orWhere('account_no', 'like', '%' . $customerSearch . '%');
+                        });
+                    });
+            });
+        }
+
+        $bills = $query->orderBy('created_at', 'desc')->paginate(20);
+
+        return response()->json([
+            'data' => $bills,
+        ]);
+    }
+
+public function monthlyReport(Request $request)
+{
+     $validated = $request->validate([
+        'month' => ['required', 'date_format:Y-m'],
+        'brgy_id' => ['nullable', 'integer', 'exists:barangay_sequence,brgy_id'],
+    ]);
+
+    $month = Carbon::createFromFormat('Y-m', $validated['month'])->startOfMonth();
+    $barangayId = $validated['brgy_id'] ?? null;
+    
+    // Define the billing cycle: include first 5 days of next month as part of this month
+    $billingStart = $month->copy()->startOfMonth();
+    $billingEnd = $month->copy()->endOfMonth()->addDays(5); // Include up to 5th of next month
+
+    if (!$barangayId) {
+        return $this->allBarangaysMonthlyReport($month, $billingStart, $billingEnd);
+    }
+    
+    $billsQuery = Bill::with(['customer', 'reading'])
+        ->whereBetween('bill_date', [$billingStart, $billingEnd])
+        ->orderBy('customer_account_number');
+
+    if ($barangayId) {
+        $billsQuery->whereHas('customer', fn ($customer) => $customer->where('brgy_id', $barangayId));
+    }
+
+    $bills = $billsQuery->get();
+    
+    $customersQuery = Customer::orderBy('account_no');
+    if ($barangayId) {
+        $customersQuery->where('brgy_id', $barangayId);
+    }
+    $allCustomers = $customersQuery->get()->keyBy('account_no');
+    
+    $reportData = [];
+    $processedAccounts = [];
+    
+    foreach ($bills as $bill) {
+        $accountNo = $bill->customer_account_number;
+        $processedAccounts[] = $accountNo;
+        $reportData[] = [
+            'account_no' => $accountNo,
+            'customer_name' => $bill->customer->customer_name ?? 'Unknown',
+            'previous_reading' => $bill->reading->previous_reading ?? '',
+            'current_reading' => $bill->reading->current_reading ?? '',
+            'usage_m3' => $bill->reading->usage_m3 ?? '',
+            'status' => $bill->status,
+            'total_due' => (float) $bill->total_due,
+            'has_bill' => true,
+        ];
+    }
+    
+    foreach ($allCustomers as $accountNo => $customer) {
+        if (!in_array($accountNo, $processedAccounts)) {
+            $reportData[] = [
+                'account_no' => $customer->account_no,
+                'customer_name' => $customer->customer_name,
+                'previous_reading' => '',
+                'current_reading' => '',
+                'usage_m3' => '',
+                'status' => $customer->status == 'disconnected' ? 'Disconnected' : 'No Bill',
+                'total_due' => 0,
+                'has_bill' => false,
+            ];
+        }
+    }
+    
+    usort($reportData, function($a, $b) {
+        return strcmp($a['account_no'], $b['account_no']);
+    });
+
+    $barangay = $barangayId
+        ? \App\Models\BarangaySequence::find($barangayId)?->barangay
+        : 'All Barangays';
+    $filenameBarangay = preg_replace('/[^A-Za-z0-9_-]+/', '-', $barangay);
+    $filename = "monthly-billing-report-{$filenameBarangay}-{$month->format('Y-m')}.xlsx";
+
+    $spreadsheet = new Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setTitle("Billing {$month->format('M Y')}");
+    
+    $sheet->getColumnDimension('A')->setWidth(18);
+    $sheet->getColumnDimension('B')->setWidth(35);
+    $sheet->getColumnDimension('C')->setWidth(15);
+    $sheet->getColumnDimension('D')->setWidth(15);
+    $sheet->getColumnDimension('E')->setWidth(12);
+    $sheet->getColumnDimension('F')->setWidth(18);
+    $sheet->getColumnDimension('G')->setWidth(18);
+    
+    // TITLE
+    $sheet->setCellValue('A1', 'MONTHLY WATER BILLING REPORT');
+    $sheet->mergeCells('A1:G1');
+    $sheet->getStyle('A1:G1')->applyFromArray([
+        'font' => ['bold' => true, 'size' => 16, 'color' => ['rgb' => 'FFFFFF']],
+        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '0F3D5E']],
+        'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+    ]);
+    $sheet->getRowDimension(1)->setRowHeight(35);
+    
+    // SUBTITLE
+    $sheet->setCellValue('A2', "Barangay: {$barangay}  •  Billing Month: {$month->format('F Y')}");
+    $sheet->mergeCells('A2:G2');
+    $sheet->getStyle('A2:G2')->applyFromArray([
+        'font' => ['italic' => true, 'size' => 11, 'color' => ['rgb' => '475569']],
+        'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+    ]);
+    $sheet->getRowDimension(2)->setRowHeight(22);
+    
+    // HEADERS
+    $headers = ['Account Number', 'Customer Name', 'Previous Reading', 'Present Reading', 'Usage (m³)', 'Status', 'Total Amount'];
+    $col = 'A';
+    foreach ($headers as $header) {
+        $sheet->setCellValue($col . '4', $header);
+        $col++;
+    }
+    $sheet->getStyle('A4:G4')->applyFromArray([
+        'font' => ['bold' => true, 'size' => 11, 'color' => ['rgb' => 'FFFFFF']],
+        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '0E7490']],
+        'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER, 'wrapText' => true],
+        'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => '0891B2']]],
+    ]);
+    $sheet->getRowDimension(4)->setRowHeight(25);
+    
+    // DATA ROWS
+    $row = 5;
+    $totalAmount = 0;
+    $totalPaid = 0;
+    $totalPending = 0;
+    
+    foreach ($reportData as $index => $data) {
+        $sheet->setCellValue('A' . $row, $data['account_no']);
+        $sheet->setCellValue('B' . $row, $data['customer_name']);
+        $sheet->setCellValue('C' . $row, $data['previous_reading'] !== '' ? $data['previous_reading'] : '');
+        $sheet->setCellValue('D' . $row, $data['current_reading'] !== '' ? $data['current_reading'] : '');
+        $sheet->setCellValue('E' . $row, $data['usage_m3'] !== '' ? $data['usage_m3'] : '');
+        
+        $statusValue = $data['status'] === 'Disconnected' ? 'Disconnected' : ucfirst(strtolower($data['status']));
+        $sheet->setCellValue('F' . $row, $statusValue);
+        
+        switch (strtolower($data['status'])) {
+            case 'paid': $statusColor = '16A34A'; break;
+            case 'pending': $statusColor = 'EA580C'; break;
+            case 'disconnected': $statusColor = 'DC2626'; break;
+            case 'void': $statusColor = '6B7280'; break;
+            case 'due': $statusColor = 'CA8A04'; break;
+            default: $statusColor = '4B5563';
+        }
+        
+        $sheet->getStyle('F' . $row)->applyFromArray([
+            'font' => ['bold' => true, 'color' => ['rgb' => $statusColor]],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+        ]);
+        
+        $sheet->setCellValue('G' . $row, $data['total_due']);
+        $sheet->getStyle('G' . $row)->getNumberFormat()->setFormatCode('₱#,##0.00');
+        $sheet->getStyle('G' . $row)->getAlignment()->setHorizontal(Alignment::HORIZONTAL_RIGHT);
+        
+        $sheet->getStyle('A' . $row . ':G' . $row)->applyFromArray([
+            'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'D1D5DB']]],
+        ]);
+        
+        // Alternate row colors - FIXED
+        if ($index % 2 == 1) {
+            $sheet->getStyle('A' . $row . ':G' . $row)->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->setStartColor(new Color('F8FAFC'));
+        }
+        
+        $sheet->getStyle('C' . $row . ':E' . $row)->getAlignment()
+            ->setHorizontal(Alignment::HORIZONTAL_CENTER);
+        
+        if ($data['has_bill']) {
+            $totalAmount += $data['total_due'];
+            if (strtolower($data['status']) == 'paid') $totalPaid += $data['total_due'];
+            if (strtolower($data['status']) == 'pending') $totalPending += $data['total_due'];
+        }
+        
+        $row++;
+    }
+    
+    // SUMMARY
+    $row++;
+    $sheet->setCellValue('A' . $row, 'SUMMARY');
+    $sheet->mergeCells('A' . $row . ':G' . $row);
+    $sheet->getStyle('A' . $row . ':G' . $row)->applyFromArray([
+        'font' => ['bold' => true, 'size' => 12, 'color' => ['rgb' => 'FFFFFF']],
+        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '0F3D5E']],
+        'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+    ]);
+    $row++;
+    
+    $summaryData = [
+        ['Total Customers', count($reportData)],
+        ['Active with Bills', count(array_filter($reportData, fn($d) => $d['has_bill']))],
+        ['Disconnected', count(array_filter($reportData, fn($d) => $d['status'] === 'Disconnected'))],
+        ['No Bill', count(array_filter($reportData, fn($d) => $d['status'] === 'No Bill'))],
+        ['', ''],
+        ['Total Amount Due', '₱' . number_format($totalAmount, 2)],
+        ['Total Collected', '₱' . number_format($totalPaid, 2)],
+        ['Total Pending', '₱' . number_format($totalPending, 2)],
+    ];
+    
+    foreach ($summaryData as $summaryRow) {
+        $sheet->setCellValue('A' . $row, $summaryRow[0]);
+        $sheet->setCellValue('B' . $row, $summaryRow[1]);
+        $sheet->mergeCells('B' . $row . ':C' . $row);
+        
+        if (!empty($summaryRow[0])) {
+            $sheet->getStyle('A' . $row)->getFont()->setBold(true);
+        }
+        if (strpos($summaryRow[0], 'Total') === 0) {
+            $sheet->getStyle('A' . $row . ':C' . $row)->getFont()
+                ->setBold(true)->setSize(11);
+        }
+        $row++;
+    }
+    
+    // FOOTER
+    $row++;
+    $sheet->setCellValue('A' . $row, 'Generated on: ' . now()->format('F d, Y  h:i A'));
+    $sheet->mergeCells('A' . $row . ':G' . $row);
+    $sheet->getStyle('A' . $row)->applyFromArray([
+        'font' => ['italic' => true, 'size' => 9, 'color' => ['rgb' => '6B7280']],
+        'alignment' => ['horizontal' => Alignment::HORIZONTAL_RIGHT],
+    ]);
+    
+    $sheet->freezePane('A5');
+    $sheet->setAutoFilter('A4:G4');
+    
+    $writer = new Xlsx($spreadsheet);
+    $temporaryFile = tempnam(sys_get_temp_dir(), 'monthly-billing-report-') . '.xlsx';
+    $writer->save($temporaryFile);
+
+    return response()->download($temporaryFile, $filename, [
+        'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ])->deleteFileAfterSend(true);
+}
+
+    private function allBarangaysMonthlyReport(Carbon $month, Carbon $billingStart, Carbon $billingEnd)
+    {
+        $barangays = \App\Models\BarangaySequence::orderBy('brgy_id')->get();
+        $customerTypes = \App\Models\CustomerType::pluck('type_name', 'type_id');
+        $customersByBarangay = Customer::orderBy('account_no')->get()->groupBy('brgy_id');
+        $billsByAccount = Bill::with(['customer', 'reading'])
+            ->whereBetween('bill_date', [$billingStart, $billingEnd])
+            ->orderBy('bill_date', 'desc')
+            ->get()
+            ->keyBy('customer_account_number');
+
+        $spreadsheet = new Spreadsheet();
+        $spreadsheet->getDefaultStyle()->getFont()->setName('Calibri')->setSize(11);
+        $moneyFormat = '"PHP "#,##0.00';
+        $colors = [
+            'navy' => '16324F', 'teal' => '0F766E', 'tealLight' => 'CCFBF1',
+            'gold' => 'D9A441', 'goldLight' => 'FEF3C7', 'slate' => '475569',
+            'muted' => '64748B', 'line' => 'CBD5E1', 'soft' => 'F1F5F9',
+            'white' => 'FFFFFF', 'danger' => 'B91C1C',
+        ];
+
+        $sectionForType = function (?string $typeName): string {
+            $type = strtolower((string) $typeName);
+            if (str_contains($type, 'communal')) return 'LEVEL - II';
+            if (str_contains($type, 'commercial')) return 'COMMERCIAL';
+            if (str_contains($type, 'officer')) return "OFFICER'S RATE";
+            return 'LEVEL - III';
+        };
+
+        $summary = [];
+
+        foreach ($barangays as $sheetIndex => $barangay) {
+            $sheet = $sheetIndex === 0 ? $spreadsheet->getActiveSheet() : $spreadsheet->createSheet();
+            $sheetName = substr(preg_replace('/[\\\\\\/\\?\\*\\[\\]:]+/', '-', $barangay->barangay), 0, 31);
+            $sheet->setTitle($sheetName ?: "Barangay {$barangay->brgy_id}");
+            $sheet->getDefaultRowDimension()->setRowHeight(20);
+            $sheet->setShowGridlines(false);
+            $sheet->getSheetView()->setZoomScale(90);
+            $sheet->getTabColor()->setRGB($colors['teal']);
+
+            foreach (['A' => 8, 'B' => 30, 'C' => 4, 'D' => 17, 'E' => 18, 'F' => 18, 'G' => 14, 'H' => 15, 'I' => 20, 'J' => 22, 'K' => 14] as $column => $width) {
+                $sheet->getColumnDimension($column)->setWidth($width);
+            }
+
+            $sheet->mergeCells('A1:K1');
+            $sheet->setCellValue('A1', 'DMBC WATER BILLING REPORT');
+            $sheet->mergeCells('A2:K2');
+            $sheet->setCellValue('A2', strtoupper($barangay->barangay));
+            $sheet->mergeCells('A3:K3');
+            $sheet->setCellValue('A3', 'Billing period: ' . $billingStart->format('M d, Y') . ' - ' . $billingEnd->format('M d, Y') . '  |  Report month: ' . $month->format('F Y'));
+            $sheet->getRowDimension(1)->setRowHeight(32);
+            $sheet->getRowDimension(2)->setRowHeight(26);
+            $sheet->getStyle('A1:K1')->applyFromArray([
+                'font' => ['bold' => true, 'size' => 18, 'color' => ['rgb' => $colors['white']]],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['navy']]],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            ]);
+            $sheet->getStyle('A2:K2')->applyFromArray([
+                'font' => ['bold' => true, 'size' => 13, 'color' => ['rgb' => $colors['white']]],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['teal']]],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            ]);
+            $sheet->getStyle('A3:K3')->applyFromArray([
+                'font' => ['italic' => true, 'size' => 10, 'color' => ['rgb' => $colors['slate']]],
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['soft']]],
+                'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+            ]);
+
+            $row = 3;
+            $barangaySummary = [
+                'barangay' => $barangay->barangay,
+                'LEVEL - II' => 0,
+                'LEVEL - III' => 0,
+                'COMMERCIAL' => 0,
+                "OFFICER'S RATE" => 0,
+                'gross' => 0,
+                'delayed' => 0,
+                'penalty' => 0,
+            ];
+
+            $customers = $customersByBarangay->get($barangay->brgy_id, collect())
+                ->groupBy(fn ($customer) => $sectionForType($customerTypes[$customer->type_id] ?? null));
+
+            foreach (['LEVEL - III', 'LEVEL - II', 'COMMERCIAL', "OFFICER'S RATE"] as $section) {
+                $sectionCustomers = $customers->get($section, collect());
+                if ($sectionCustomers->isEmpty()) {
+                    continue;
+                }
+
+                $row++;
+                $sheet->mergeCells("A{$row}:K{$row}");
+                $sheet->setCellValue("A{$row}", $section);
+                $sheet->getRowDimension($row)->setRowHeight(24);
+                $sheet->getStyle("A{$row}:K{$row}")->applyFromArray([
+                    'font' => ['bold' => true, 'size' => 11, 'color' => ['rgb' => $colors['white']]],
+                    'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['teal']]],
+                    'alignment' => ['horizontal' => Alignment::HORIZONTAL_LEFT, 'vertical' => Alignment::VERTICAL_CENTER, 'indent' => 1],
+                ]);
+
+                $row++;
+                $sheet->mergeCells("C{$row}:D{$row}");
+                $sheet->mergeCells("F{$row}:G{$row}");
+                $sheet->fromArray([
+                    '',
+                    '',
+                    "Billing Month: {$billingStart->format('M. j')}-{$month->copy()->endOfMonth()->format('j, Y')}",
+                    '',
+                    'Collection Date:',
+                    'To be collect by the month of:',
+                    '',
+                    $billingEnd->copy()->addMonth()->format('M. Y'),
+                ], null, "A{$row}");
+                $sheet->getStyle("A{$row}:K{$row}")->applyFromArray([
+                    'font' => ['size' => 9, 'color' => ['rgb' => $colors['muted']]],
+                    'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['soft']]],
+                    'alignment' => ['vertical' => Alignment::VERTICAL_CENTER],
+                ]);
+
+                $row++;
+                $sheet->fromArray(['NO.', 'CUSTOMER NAME', '', 'ACCOUNT / METER', 'PREVIOUS READING', 'CURRENT READING', 'USAGE (m3)', 'PENALTY', 'MONTHLY COLLECTION', 'OUTSTANDING BALANCE', 'STATUS'], null, "A{$row}");
+                $sheet->getRowDimension($row)->setRowHeight(34);
+                $sheet->getStyle("A{$row}:K{$row}")->applyFromArray([
+                    'font' => ['bold' => true, 'size' => 9, 'color' => ['rgb' => $colors['white']]],
+                    'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['navy']]],
+                    'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER, 'wrapText' => true],
+                    'borders' => ['bottom' => ['borderStyle' => Border::BORDER_MEDIUM, 'color' => ['rgb' => $colors['gold']]]],
+                ]);
+
+                $row++;
+                $sectionStartRow = $row;
+                $sectionUsage = 0;
+                $sectionCollection = 0;
+                $sectionCollectable = 0;
+                $sectionPenalty = 0;
+                $number = 1;
+
+                foreach ($sectionCustomers as $customer) {
+                    $bill = $billsByAccount->get($customer->account_no);
+                    $status = strtolower((string) ($bill?->status ?? ''));
+                    $usage = $bill?->reading?->usage_m3;
+                    $penalty = (float) ($bill?->penalty ?? 0);
+                    $amount = (float) ($bill?->total_due ?? 0);
+                    $monthlyCollection = $bill && $status === 'paid' ? $amount : null;
+                    $collectable = $bill && in_array($status, ['pending', 'due'], true) ? $amount : null;
+                    $displayName = $customer->customer_name;
+                    $statusLabel = $bill
+                        ? ucfirst($status)
+                        : (strtolower((string) $customer->status) === 'disconnected' ? 'Disconnected' : 'No Bill');
+
+                    if (!$bill && $customer->status === 'disconnected') {
+                        $displayName .= ' CLOSED';
+                    }
+
+                    $sheet->fromArray([
+                        $number,
+                        $displayName,
+                        '',
+                        $customer->account_no,
+                        $bill?->reading?->previous_reading ?? '',
+                        $bill?->reading?->current_reading ?? '',
+                        $usage ?? '',
+                        $penalty > 0 ? $penalty : null,
+                        $monthlyCollection,
+                        $collectable,
+                        $statusLabel,
+                    ], null, "A{$row}");
+                    $sheet->getStyle("A{$row}:K{$row}")->applyFromArray([
+                        'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $number % 2 === 0 ? $colors['soft'] : $colors['white']]],
+                        'borders' => ['bottom' => ['borderStyle' => Border::BORDER_HAIR, 'color' => ['rgb' => $colors['line']]]],
+                        'alignment' => ['vertical' => Alignment::VERTICAL_CENTER],
+                    ]);
+                    $sheet->getStyle("A{$row}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+                    $sheet->getStyle("D{$row}:G{$row}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+                    $sheet->getStyle("H{$row}:J{$row}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_RIGHT);
+                    $sheet->getStyle("H{$row}:J{$row}")->getNumberFormat()->setFormatCode($moneyFormat);
+                    $sheet->getStyle("K{$row}")->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+                    $statusColor = match ($statusLabel) {
+                        'Paid' => $colors['teal'],
+                        'Due' => $colors['gold'],
+                        'Pending' => $colors['danger'],
+                        'Disconnected' => $colors['danger'],
+                        default => $colors['muted'],
+                    };
+                    $sheet->getStyle("K{$row}")->getFont()->setBold(true)->setColor(new Color($statusColor));
+                    if (str_ends_with($displayName, ' CLOSED')) {
+                        $sheet->getStyle("B{$row}")->getFont()->setColor(new Color($colors['danger']))->setItalic(true);
+                    }
+
+                    $sectionUsage += (int) ($usage ?? 0);
+                    $sectionCollection += (float) ($monthlyCollection ?? 0);
+                    $sectionCollectable += (float) ($collectable ?? 0);
+                    $sectionPenalty += $penalty;
+                    $barangaySummary[$section] += (float) ($monthlyCollection ?? 0);
+                    $barangaySummary['gross'] += $amount;
+                    $barangaySummary['delayed'] += (float) ($collectable ?? 0);
+                    $barangaySummary['penalty'] += $penalty;
+                    $number++;
+                    $row++;
+                }
+
+                $sheet->fromArray(['TOTAL', '', '', '', '', '', $sectionUsage, $sectionPenalty, $sectionCollection, $sectionCollectable, ''], null, "A{$row}");
+                $sheet->getStyle("A{$row}:K{$row}")->applyFromArray([
+                    'font' => ['bold' => true, 'color' => ['rgb' => $colors['navy']]],
+                    'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['goldLight']]],
+                    'borders' => [
+                        'top' => ['borderStyle' => Border::BORDER_MEDIUM, 'color' => ['rgb' => $colors['gold']]],
+                        'bottom' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => $colors['gold']]],
+                    ],
+                ]);
+                $sheet->getStyle("H{$sectionStartRow}:J{$row}")->getNumberFormat()->setFormatCode($moneyFormat);
+                $row++;
+            }
+
+            if ($row === 3) {
+                $sheet->setCellValue('A5', 'No customers found for this barangay.');
+            }
+
+            $sheet->freezePane('A6');
+            $sheet->getPageSetup()
+                ->setOrientation(\PhpOffice\PhpSpreadsheet\Worksheet\PageSetup::ORIENTATION_LANDSCAPE)
+                ->setPaperSize(\PhpOffice\PhpSpreadsheet\Worksheet\PageSetup::PAPERSIZE_A4)
+                ->setFitToWidth(1)
+                ->setFitToHeight(0);
+            $sheet->getPageSetup()->setRowsToRepeatAtTopByStartAndEnd(1, 3);
+            $sheet->getPageSetup()->setPrintArea("A1:K{$row}");
+            $sheet->getPageMargins()->setTop(0.5)->setRight(0.3)->setLeft(0.3)->setBottom(0.5);
+            $sheet->getHeaderFooter()->setOddFooter('&LDMBC Water System  |  ' . $sheet->getTitle() . '&RPage &P of &N');
+            $summary[] = $barangaySummary;
+        }
+
+        $summarySheet = $spreadsheet->createSheet();
+        $summarySheet->setTitle('DMBC-Summary');
+        $summarySheet->setShowGridlines(false);
+        $summarySheet->getSheetView()->setZoomScale(95);
+        $summarySheet->getTabColor()->setRGB($colors['gold']);
+        foreach (['A' => 22, 'B' => 16, 'C' => 16, 'D' => 16, 'E' => 16, 'F' => 20, 'G' => 20, 'H' => 16] as $column => $width) {
+            $summarySheet->getColumnDimension($column)->setWidth($width);
+        }
+        $summarySheet->setCellValue('A1', 'DMBC MONTHLY COLLECTION SUMMARY');
+        $summarySheet->mergeCells('A1:H1');
+        $summarySheet->getStyle('A1:H1')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 18, 'color' => ['rgb' => $colors['white']]],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['navy']]],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER],
+        ]);
+        $summarySheet->getRowDimension(1)->setRowHeight(34);
+        $summarySheet->mergeCells('A2:H2');
+        $summarySheet->setCellValue('A2', $month->format('F Y') . '  |  All Barangays');
+        $summarySheet->getStyle('A2:H2')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 12, 'color' => ['rgb' => $colors['white']]],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['teal']]],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
+        ]);
+        $summarySheet->fromArray(['BARANGAY', 'LEVEL II', 'LEVEL III', 'COMMERCIAL', 'OFFICERS', 'GROSS BILLED', 'OUTSTANDING', 'PENALTY'], null, 'A4');
+        $summarySheet->getRowDimension(4)->setRowHeight(32);
+        $summarySheet->getStyle('A4:H4')->applyFromArray([
+            'font' => ['bold' => true, 'size' => 9, 'color' => ['rgb' => $colors['white']]],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['navy']]],
+            'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER, 'vertical' => Alignment::VERTICAL_CENTER, 'wrapText' => true],
+            'borders' => ['bottom' => ['borderStyle' => Border::BORDER_MEDIUM, 'color' => ['rgb' => $colors['gold']]]],
+        ]);
+
+        $row = 5;
+        $totals = ['LEVEL - II' => 0, 'LEVEL - III' => 0, 'COMMERCIAL' => 0, "OFFICER'S RATE" => 0, 'gross' => 0, 'delayed' => 0, 'penalty' => 0];
+        foreach ($summary as $item) {
+            $summarySheet->fromArray([
+                strtoupper($item['barangay']),
+                $item['LEVEL - II'],
+                $item['LEVEL - III'],
+                $item['COMMERCIAL'],
+                $item["OFFICER'S RATE"],
+                $item['gross'],
+                $item['delayed'],
+                $item['penalty'],
+            ], null, "A{$row}");
+            $summarySheet->getStyle("A{$row}:H{$row}")->applyFromArray([
+                'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $row % 2 === 0 ? $colors['white'] : $colors['soft']]],
+                'borders' => ['bottom' => ['borderStyle' => Border::BORDER_HAIR, 'color' => ['rgb' => $colors['line']]]],
+            ]);
+            foreach ($totals as $key => $value) {
+                $totals[$key] += $item[$key];
+            }
+            $row++;
+        }
+        $summarySheet->fromArray(['TOTAL', $totals['LEVEL - II'], $totals['LEVEL - III'], $totals['COMMERCIAL'], $totals["OFFICER'S RATE"], $totals['gross'], $totals['delayed'], $totals['penalty']], null, "A{$row}");
+        $summarySheet->getStyle("A{$row}:H{$row}")->applyFromArray([
+            'font' => ['bold' => true, 'color' => ['rgb' => $colors['navy']]],
+            'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $colors['goldLight']]],
+            'borders' => [
+                'top' => ['borderStyle' => Border::BORDER_MEDIUM, 'color' => ['rgb' => $colors['gold']]],
+                'bottom' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => $colors['gold']]],
+            ],
+        ]);
+        $summarySheet->getStyle("B5:H{$row}")->getNumberFormat()->setFormatCode($moneyFormat);
+        $summarySheet->freezePane('A5');
+        $summarySheet->setAutoFilter("A4:H{$row}");
+        $summarySheet->getPageSetup()
+            ->setOrientation(\PhpOffice\PhpSpreadsheet\Worksheet\PageSetup::ORIENTATION_LANDSCAPE)
+            ->setPaperSize(\PhpOffice\PhpSpreadsheet\Worksheet\PageSetup::PAPERSIZE_A4)
+            ->setFitToWidth(1)
+            ->setFitToHeight(1);
+        $summarySheet->getPageSetup()->setPrintArea("A1:H{$row}");
+        $summarySheet->getHeaderFooter()->setOddFooter('&LDMBC Water System&RPage &P of &N');
+        $spreadsheet->setActiveSheetIndex($spreadsheet->getIndex($summarySheet));
+
+        $filename = "monthly-billing-report-All-Barangays-{$month->format('Y-m')}.xlsx";
+        $writer = new Xlsx($spreadsheet);
+        $temporaryFile = tempnam(sys_get_temp_dir(), 'monthly-billing-report-all-') . '.xlsx';
+        $writer->save($temporaryFile);
+
+        return response()->download($temporaryFile, $filename, [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        ])->deleteFileAfterSend(true);
+    }
+
+    public function indexByCustomer(Request $request, Customer $customer)
+    {
+        $status = $request->query('status');
+
+        $customerId = $customer->getKey();
+
+        $query = Bill::where('customer_id', $customerId);
+
+        if ($status) {
+            $query->whereRaw('LOWER(status) = ?', [strtolower($status)]);
+        }
+
+        $bills = $query->orderBy('created_at', 'desc')->get();
+
+        return response()->json([
+            'data' => $bills,
+        ]);
+    }
+
+    public function paymentsByCustomer(Request $request, Customer $customer)
+    {
+        $limit = $request->query('limit', 10);
+
+        $customerId = $customer->getKey();
+
+        $payments = BillTransaction::whereHas('bill', function ($query) use ($customerId) {
+            $query->where('customer_id', $customerId);
+        })
+        ->whereIn('type', ['payment', 'void'])
+        ->with(['bill', 'processedBy'])
+        ->orderBy('transaction_date', 'desc')
+        ->limit($limit)
+        ->get()
+        ->map(function ($transaction) {
+            return [
+                'id' => $transaction->getKey(),
+                'reference_number' => $transaction->bill?->reference_number ?? $transaction->bill_reference_number,
+                'amount_paid' => $transaction->amount,
+                'cash_received' => $transaction->cash_received,
+                'change' => $transaction->change,
+                'payment_method' => $transaction->payment_method,
+                'processed_by' => $transaction->processedBy?->name,
+                'created_at' => $transaction->transaction_date,
+                'notes' => $transaction->notes,
+                'type' => $transaction->type,
+            ];
+        });
+
+        return response()->json([
+            'data' => $payments,
+        ]);
+    }
+
+    public function pay(Request $request, Bill $bill, AuditLogService $audit, BillingStatusService $billingStatus)
+    {
+        $billingStatus->refreshDueBills($bill->customer_id);
+        $bill->refresh();
+        if (in_array(strtolower((string) $bill->status), ['paid', 'void'], true)) {
+            return response()->json([
+                'message' => 'This bill cannot receive a payment.'
+            ], 422);
+        }
+
+        $validated = $request->validate([
+            'amount_paid' => ['required', 'numeric', 'min:0'],
+            'cash_received' => ['required', 'numeric', 'min:0'],
+            'change_amount' => ['required', 'numeric'],
+            'payment_method' => ['required', 'string', 'in:cash'],
+        ]);
+
+        // The cashier modal collects the balance currently shown to the user.
+        // Never add a new hidden penalty after that amount has been entered.
+        // Any penalty already recorded on the bill remains part of its balance.
+        $payment = DB::transaction(function () use ($bill, $validated, $audit) {
+            $bill->refresh();
+            $balance = max((float) ($bill->balance_due ?? $bill->total_due), 0);
+            $before = $bill->getAttributes();
+            $amount = (float) $validated['amount_paid'];
+
+            if ($amount <= 0 || $amount > $balance + 0.01) {
+                abort(422, 'Payment cannot exceed the bill balance.');
+            }
+
+            $bill->amount_paid = (float) ($bill->amount_paid ?? 0) + $amount;
+            $bill->balance_due = max((float) $bill->total_due - (float) $bill->amount_paid, 0);
+            $bill->status = $bill->balance_due <= 0.01 ? 'Paid' : 'Partially Paid';
+            $bill->save();
+
+            $audit->record('payment_recorded', $bill, $before, $bill->getAttributes(), [
+                'amount' => $amount,
+                'cash_received' => $validated['cash_received'],
+                'change' => $validated['change_amount'],
+                'source' => 'office',
+            ]);
+
+            return BillTransaction::create([
+                'bill_id' => $bill->bill_id,
+                'bill_reference_number' => $bill->reference_number,
+                'device_uid' => $bill->device_uid,
+                'type' => 'payment',
+                'source' => 'Office',
+                'amount' => $amount,
+                'cash_received' => $validated['cash_received'],
+                'change' => $validated['change_amount'],
+                'transaction_date' => now(),
+                'payment_method' => $validated['payment_method'],
+                'processed_by_user_id' => auth()->id(),
+                'notes' => 'Payment recorded via web system in the office.',
+            ]);
+        });
+
+        return response()->json([
+            'data' => $bill->fresh(),
+            'receipt' => app(ReceiptService::class)->build($bill->fresh(), $payment),
+        ]);
+    }
+
+    public function todayPayments(Request $request)
+    {
+        $today = now()->toDateString();
+
+        $payments = Bill::where('status', 'paid')
+            ->whereDate('updated_at', $today)
+            ->get();
+
+        return response()->json([
+            'count' => $payments->count(),
+            'total' => $payments->sum('total_due'),
+        ]);
+    }
+
+    public function monthlyPayments(Request $request)
+    {
+        $currentMonth = now()->month;
+        $currentYear = now()->year;
+
+        $payments = Bill::where('status', 'paid')
+            ->whereYear('updated_at', $currentYear)
+            ->whereMonth('updated_at', $currentMonth)
+            ->get();
+
+        return response()->json([
+            'count' => $payments->count(),
+            'total' => $payments->sum('total_due'),
+        ]);
+    }
+
+    public function monthlyCollectable(Request $request)
+    {
+        $currentMonth = now()->month;
+        $currentYear = now()->year;
+
+        $collectable = Bill::whereIn('status', ['pending', 'Pending', 'due', 'Due'])
+            ->whereYear('due_date', $currentYear)
+            ->whereMonth('due_date', $currentMonth)
+            ->get();
+
+        return response()->json([
+            'count' => $collectable->count(),
+            'total' => $collectable->sum('total_due'),
+        ]);
+    }
+
+    public function stats(Request $request)
+    {
+        $pending = Bill::where('status', 'pending')->count();
+
+        $overdue = Bill::whereIn('status', ['pending', 'Pending', 'due', 'Due'])
+            ->where('due_date', '<', now()->toDateString())
+            ->count();
+
+        return response()->json([
+            'pending' => $pending,
+            'overdue' => $overdue,
+        ]);
+    }
+    public function markPaid(Request $request, Bill $bill, AuditLogService $audit)
+    {
+        $validated = $request->validate([
+            'status' => ['nullable', 'string', 'in:paid'],
+        ]);
+
+        // Apply penalty at payment time (if overdue beyond grace days).
+        $settings = Setting::query()->orderBy('id')->first();
+        $penaltyEnabled = $settings?->penalty_enabled ?? true;
+        $penaltyAfterDays = $settings ? (int) $settings->penalty_after_days : (int) env('PENALTY_AFTER_DAYS', 0);
+        $penaltyAmount = $this->resolvePenaltyAmount($bill, $settings);
+
+        $penalty = 0.0;
+        if ($penaltyEnabled && $bill->due_date) {
+            $threshold = Carbon::parse($bill->due_date)->addDays($penaltyAfterDays);
+            if (now()->greaterThan($threshold) && $penaltyAmount > 0) {
+                $penalty = $penaltyAmount;
+            }
+        }
+
+        DB::transaction(function () use ($bill, $penalty, $audit) {
+            $bill->refresh();
+            $before = $bill->getAttributes();
+            $bill->penalty = $penalty;
+            $bill->total_due = (float) $bill->charges + (float) $bill->penalty;
+            $amount = max((float) $bill->total_due - (float) ($bill->amount_paid ?? 0), 0);
+            $bill->amount_paid = (float) ($bill->amount_paid ?? 0) + $amount;
+            $bill->balance_due = max((float) $bill->total_due - (float) $bill->amount_paid, 0);
+            $bill->status = 'Paid';
+            $bill->save();
+
+            $audit->record('bill_marked_paid', $bill, $before, $bill->getAttributes(), [
+                'amount' => $amount,
+                'source' => 'office',
+            ]);
+
+            BillTransaction::create([
+                'bill_id' => $bill->bill_id,
+                'bill_reference_number' => $bill->reference_number,
+                'device_uid' => $bill->device_uid,
+                'type' => 'payment',
+                'source' => 'Office',
+                'amount' => $amount,
+                'cash_received' => $amount,
+                'change' => 0,
+                'transaction_date' => now(),
+                'payment_method' => 'cash',
+                'processed_by_user_id' => auth()->id(),
+                'notes' => 'Payment recorded via web system in the office.',
+            ]);
+        });
+
+        return response()->json([
+            'data' => $bill->fresh(),
+        ]);
+    }
+
+    public function void(Request $request, Bill $bill, AuditLogService $audit)
+    {
+        // Check if bill can be voided
+        if (!in_array(strtolower((string) $bill->status), ['paid', 'partially paid'], true)) {
+            return response()->json([
+                'message' => 'Only paid bills can be voided.'
+            ], 422);
+        }
+
+        $validated = $request->validate([
+            'reason' => ['nullable', 'string', 'max:1000'],
+        ]);
+
+        DB::transaction(function () use ($bill, $validated, $audit) {
+            $bill->refresh();
+            $paidAmount = (float) ($bill->amount_paid ?? 0);
+            $before = $bill->getAttributes();
+            $bill->amount_paid = 0;
+            $bill->balance_due = (float) $bill->total_due;
+            $bill->status = 'Pending';
+            $bill->void_reason = $validated['reason'] ?? null;
+            $bill->save();
+
+            $audit->record('bill_voided', $bill, $before, $bill->getAttributes(), [
+                'reason' => $validated['reason'] ?? null,
+                'source' => 'office',
+            ]);
+
+            BillTransaction::create([
+                'bill_id' => $bill->bill_id,
+                'bill_reference_number' => $bill->reference_number,
+                'device_uid' => $bill->device_uid,
+                'type' => 'void',
+                'source' => 'Office',
+                'amount' => $paidAmount,
+                'change' => 0,
+                'transaction_date' => now(),
+                'payment_method' => 'adjustment',
+                'processed_by_user_id' => auth()->id(),
+                'notes' => $validated['reason'] ?? null,
+            ]);
+        });
+
+        return response()->json([
+            'data' => $bill->fresh(),
+        ]);
+    }
+
+    public function transactions(Request $request)
+    {
+        $limit = $request->query('limit', 50);
+
+        $transactions = BillTransaction::with(['bill.customer', 'processedBy'])
+            ->orderBy('transaction_date', 'desc')
+            ->limit($limit)
+            ->get();
+
+        return response()->json([
+            'data' => $transactions,
+        ]);
+    }
+
+    public function getPayment(Request $request, Bill $bill)
+    {
+        $transaction = BillTransaction::where('bill_reference_number', $bill->reference_number)
+            ->where('type', 'payment')
+            ->orderByDesc('transaction_date')
+            ->orderByDesc('bill_transaction_id')
+            ->first();
+
+        if (!$transaction) {
+            return response()->json([
+                'message' => 'No payment found for this bill.'
+            ], 404);
+        }
+
+        return response()->json([
+            ...$transaction->toArray(),
+            'receipt' => app(ReceiptService::class)->build($bill, $transaction),
+        ]);
+    }
+
+    /**
+     * Retained so older clients receive a clear upgrade message.
+     */
+    public function sync(Request $request) {
+        abort(409, 'Incoming device records require a complete sync review. Update DMBC and start a new sync.');
+    }
+
+private function resolvePenaltyAmount(Bill $bill, ?Setting $settings = null): float
+{
+    $customer = DB::table('customer as c')
+        ->leftJoin('customer_type as ct', 'ct.type_id', '=', 'c.type_id')
+        ->leftJoin('deduction as d', 'd.deduction_id', '=', 'c.deduction_id')
+        ->where('c.customer_id', $bill->customer_id)
+        ->select('ct.penalty as category_penalty', 'd.name as deduction_name')
+        ->first();
+
+    // Senior citizens receive the fixed ₱20 penalty regardless of category.
+    if ($customer && str_contains(strtolower((string) $customer->deduction_name), 'senior')) {
+        return 20.00;
+    }
+
+    if ($customer && $customer->category_penalty !== null) {
+        return max(0, (float) $customer->category_penalty);
+    }
+
+    return $settings
+        ? max(0, (float) $settings->penalty_amount)
+        : max(0, (float) env('PENALTY_AMOUNT', 0.00));
+}
+    /**
+     * Retained so older clients receive a clear upgrade message.
+     */
+    public function syncTransactions(Request $request) {
+        abort(409, 'Incoming device records require a complete sync review. Update DMBC and start a new sync.');
+    }
+
+    /**
+     * Mark bill transactions as synced after successful device sync.
+     */
+    public function markTransactionsSynced(Request $request)
+    {
+        $validated = $request->validate([
+            'bill_transaction_ids' => ['required', 'array'],
+            'bill_transaction_ids.*' => ['required', 'integer'],
+        ]);
+
+        $updated = BillTransaction::whereIn('bill_transaction_id', $validated['bill_transaction_ids'])
+            ->update([
+                'Synced' => true,
+                'last_sync' => now(),
+            ]);
+
+        return response()->json([
+            'updated' => $updated,
+            'message' => "{$updated} bill transactions marked as synced",
+        ]);
+    }
+
+    /**
+     * Mark bills as synced after successful device sync.
+     */
+    public function markSynced(Request $request)
+    {
+        $validated = $request->validate([
+            'bill_ids' => ['required', 'array'],
+            'bill_ids.*' => ['required', 'integer'],
+        ]);
+
+        $updated = Bill::whereIn('bill_id', $validated['bill_ids'])
+            ->update([
+                'Synced' => true,
+                'last_sync' => now(),
+            ]);
+
+        return response()->json([
+            'updated' => $updated,
+            'message' => "{$updated} bills marked as synced",
+        ]);
+    }
+}

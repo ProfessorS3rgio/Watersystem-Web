@@ -1,0 +1,55 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Bill extends Model
+{
+    protected $table = 'bill';
+    protected $primaryKey = 'bill_id';
+
+    protected $fillable = [
+        'reference_number',
+        'customer_id',
+        'reading_id',
+        'device_uid',
+        'bill_date',
+        'rate_per_m3',
+        'charges',
+        'penalty',
+        'total_due',
+        'amount_paid',
+        'balance_due',
+        'due_date',
+        'status',
+        'void_reason',
+        'customer_account_number',
+    ];
+
+    protected $casts = [
+        'bill_date' => 'date',
+        'due_date' => 'date',
+        'rate_per_m3' => 'decimal:2',
+        'charges' => 'decimal:2',
+        'penalty' => 'decimal:2',
+        'total_due' => 'decimal:2',
+        'amount_paid' => 'decimal:2',
+        'balance_due' => 'decimal:2',
+    ];
+
+    public function customer()
+    {
+        return $this->belongsTo(Customer::class, 'customer_id', 'customer_id');
+    }
+
+    public function reading()
+    {
+        return $this->belongsTo(Reading::class, 'reading_id', 'reading_id');
+    }
+
+    public function transactions()
+    {
+        return $this->hasMany(BillTransaction::class, 'bill_reference_number', 'reference_number');
+    }
+}

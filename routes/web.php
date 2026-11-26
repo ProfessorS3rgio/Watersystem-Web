@@ -1,0 +1,113 @@
+<?php
+
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\AuthController;
+use App\Http\Controllers\CustomerController;
+use App\Http\Controllers\ReadingController;
+use App\Http\Controllers\ReadingImportController;
+use App\Http\Controllers\BillController;
+use App\Http\Controllers\DeviceController;
+use App\Http\Controllers\SettingsController;
+use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\CustomerTypeController;
+use App\Http\Controllers\BarangaySequenceController;
+use App\Http\Controllers\DeductionController;
+use App\Http\Controllers\SyncController;
+use App\Http\Controllers\AuditLogController;
+use App\Http\Controllers\BackupController;
+use App\Http\Controllers\SyncRunController;
+use App\Http\Controllers\WirelessSyncController;
+
+Route::get('/', function () {
+    return view('welcome');
+});
+
+// Lightweight endpoint to refresh CSRF/XSRF cookies for SPA requests.
+Route::get('/csrf-token', function () {
+    return response()->json(['csrf_token' => csrf_token()]);
+});
+
+// Auth routes
+Route::get('/login', fn () => redirect('/#/login'))->name('login');
+Route::post('/login', [AuthController::class, 'login']);
+Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth');
+Route::get('/user', [AuthController::class, 'user'])->middleware('auth');
+
+// Customers (JSON)
+Route::middleware('auth')->group(function () {
+    Route::get('/incidents', [\App\Http\Controllers\IncidentController::class, 'index']);
+    Route::get('/incidents/customers', [\App\Http\Controllers\IncidentController::class, 'customers']);
+    Route::post('/incidents', [\App\Http\Controllers\IncidentController::class, 'store']);
+    Route::get('/incidents/{incident}', [\App\Http\Controllers\IncidentController::class, 'show'])->whereNumber('incident');
+    Route::get('/incidents/{incident}/history', [\App\Http\Controllers\IncidentController::class, 'history'])->whereNumber('incident');
+    Route::patch('/incidents/{incident}', [\App\Http\Controllers\IncidentController::class, 'update'])->whereNumber('incident');
+    Route::post('/device-link/wifi/connect', [WirelessSyncController::class, 'connect'])->middleware('throttle:10,1');
+    Route::post('/device-link/wifi/command', [WirelessSyncController::class, 'command']);
+    Route::post('/device-link/wifi/disconnect', [WirelessSyncController::class, 'disconnect']);
+    Route::get('/dashboard', [DashboardController::class, 'index']);
+
+    Route::get('/customer-types', [CustomerTypeController::class, 'index']);
+    Route::put('/customer-types/{customerType}', [CustomerTypeController::class, 'update']);
+    Route::post('/customer-types/mark-synced', [CustomerTypeController::class, 'markSynced']);
+    Route::get('/barangays', [BarangaySequenceController::class, 'index']);
+    Route::post('/barangays/mark-synced', [BarangaySequenceController::class, 'markSynced']);
+    Route::get('/deductions', [DeductionController::class, 'index']);
+    Route::post('/deductions/mark-synced', [DeductionController::class, 'markSynced']);
+
+    Route::get('/customers', [CustomerController::class, 'index']);
+    Route::get('/customers/{customer}/profile', [\App\Http\Controllers\CustomerProfileController::class, 'show'])->whereNumber('customer');
+    Route::put('/customers/{customer}/profile', [\App\Http\Controllers\CustomerProfileController::class, 'update'])->whereNumber('customer');
+    Route::post('/customers/readings-import/preview', [ReadingImportController::class, 'preview']);
+    Route::post('/customers/readings-import/confirm', [ReadingImportController::class, 'confirm']);
+    Route::post('/customers', [CustomerController::class, 'store']);
+    Route::put('/customers/{customer}', [CustomerController::class, 'update']);
+    Route::delete('/customers/{customer}', [CustomerController::class, 'destroy']);
+    Route::post('/customers/swap-account-no', [CustomerController::class, 'swapAccountNo']);
+    Route::post('/customers/sync', [CustomerController::class, 'sync']);
+    Route::post('/customers/mark-synced', [CustomerController::class, 'markSynced']);
+
+    Route::get('/customers/{customer}/readings', [ReadingController::class, 'indexByCustomer']);
+    Route::post('/readings/mark-synced', [ReadingController::class, 'markSynced']);
+
+    Route::get('/customers/{customer}/bills', [BillController::class, 'indexByCustomer']);
+    Route::get('/customers/{customer}/payments', [BillController::class, 'paymentsByCustomer']);
+    Route::get('/bills', [BillController::class, 'index']);
+    Route::get('/bills/monthly-report', [BillController::class, 'monthlyReport']);
+    Route::post('/bills/{bill}/pay', [BillController::class, 'pay']);
+    Route::get('/bills/{bill}/payment', [BillController::class, 'getPayment']);
+    Route::post('/bills/mark-synced', [BillController::class, 'markSynced']);
+    Route::get('/bills/today-payments', [BillController::class, 'todayPayments']);
+    Route::get('/bills/monthly-payments', [BillController::class, 'monthlyPayments']);
+    Route::get('/bills/monthly-collectable', [BillController::class, 'monthlyCollectable']);
+    Route::get('/bills/stats', [BillController::class, 'stats']);
+    Route::get('/bills/transactions', [BillController::class, 'transactions']);
+    Route::post('/bill-transactions/sync', [BillController::class, 'syncTransactions']);
+    Route::post('/bill-transactions/mark-synced', [BillController::class, 'markTransactionsSynced']);
+
+    Route::post('/readings/sync', [ReadingController::class, 'sync']);
+    Route::post('/readings/inspect', [ReadingController::class, 'inspect']);
+    Route::post('/bills/sync', [BillController::class, 'sync']);
+    Route::post('/devices/sync', [DeviceController::class, 'sync']);
+
+    Route::post('/bills/{bill}/mark-paid', [BillController::class, 'markPaid']);
+    Route::post('/bills/{bill}/void', [BillController::class, 'void']);
+
+    Route::get('/settings', [SettingsController::class, 'show']);
+    Route::put('/settings', [SettingsController::class, 'update']);
+    Route::post('/settings/mark-synced', [SettingsController::class, 'markSynced']);
+
+    Route::post('/sync/reset-status', [SyncController::class, 'resetStatus']);
+    Route::post('/sync-runs', [SyncRunController::class, 'start']);
+    Route::get('/sync-reviews', [\App\Http\Controllers\SyncReviewController::class, 'history']);
+    Route::post('/sync-reviews', [\App\Http\Controllers\SyncReviewController::class, 'preview']);
+    Route::post('/sync-reviews/{id}/approve', [\App\Http\Controllers\SyncReviewController::class, 'approve']);
+    Route::post('/sync-reviews/{id}/cancel', [\App\Http\Controllers\SyncReviewController::class, 'cancel']);
+    Route::post('/sync-reviews/{id}/acknowledged', [\App\Http\Controllers\SyncReviewController::class, 'acknowledged']);
+    Route::post('/sync-runs/{run}/finish', [SyncRunController::class, 'finish']);
+    Route::get('/audit-logs', [AuditLogController::class, 'index']);
+    Route::get('/audit-logs/{auditLog}', [AuditLogController::class, 'show'])->whereNumber('auditLog');
+    Route::get('/backup/export', [BackupController::class, 'export']);
+    Route::post('/backup/restore-points', [BackupController::class, 'createRestorePoint']);
+    Route::get('/backup/restore-points', [BackupController::class, 'restorePoints']);
+    Route::post('/backup/restore-points/{snapshot}/restore', [BackupController::class, 'restore']);
+});

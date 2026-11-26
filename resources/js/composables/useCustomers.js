@@ -1,0 +1,193 @@
+import { ref, computed } from 'vue'
+
+export function useCustomers() {
+  const customers = ref([])
+  const isLoading = ref(false)
+  const errorMessage = ref('')
+  const search = ref('')
+  const customerTypes = ref([])
+  const barangays = ref([])
+  const deductions = ref([])
+
+  const activeCount = computed(() => customers.value.filter(c => c.status === 'active').length)
+  const inactiveCount = computed(() => customers.value.filter(c => c.status === 'disconnected').length)
+  const newCount = computed(() => customers.value.filter(c => Number(c.previous_reading) === 0).length)
+
+  const filteredCustomers = computed(() => customers.value)
+
+  const fetchCustomers = async (params = {}) => {
+    isLoading.value = true
+    errorMessage.value = ''
+    try {
+      const query = new URLSearchParams()
+      const searchValue = (params.search ?? search.value ?? '').trim()
+
+      if (searchValue) query.set('search', searchValue)
+      if (params.status && params.status !== 'all') query.set('status', params.status)
+      if (params.bill_state && params.bill_state !== 'all') query.set('bill_state', params.bill_state)
+      if (params.brgy_id !== null && params.brgy_id !== undefined && params.brgy_id !== '') {
+        query.set('brgy_id', params.brgy_id)
+      }
+
+      const url = query.toString() ? `/customers?${query.toString()}` : '/customers'
+
+      const res = await fetch(url, {
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin',
+      })
+
+      if (!res.ok) {
+        if (res.status === 401) {
+          errorMessage.value = 'Unauthorized. Please login again.'
+          return
+        }
+        throw new Error('Failed to load customers')
+      }
+
+      // Ensure server returned JSON (otherwise it's likely an HTML login/error page)
+      const contentType = res.headers.get('content-type') || ''
+      if (!contentType.includes('application/json')) {
+        const text = await res.text().catch(() => null)
+        errorMessage.value = 'Unexpected response from server. Likely unauthenticated or an HTML error page returned.'
+        console.error('Non-JSON response for /customers:', res.status, contentType, text)
+        return
+      }
+
+      let json
+      try {
+        json = await res.json()
+      } catch (e) {
+        errorMessage.value = 'Failed to parse server response as JSON'
+        console.error('JSON parse error for /customers:', e)
+        return
+      }
+
+      customers.value = Array.isArray(json?.data) ? json.data : []
+    } catch (e) {
+      errorMessage.value = e?.message || 'Failed to load customers'
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  const updateCustomer = async (customerId, customerData) => {
+    try {
+      const res = await window.axios.put(`/customers/${customerId}`, customerData)
+
+      await fetchCustomers()
+    } catch (error) {
+      if (error.response?.status === 422) {
+        const validationError = new Error('Please correct the highlighted fields.')
+        validationError.validationErrors = error.response.data.errors || {}
+        throw validationError
+      }
+      throw new Error(error.response?.data?.message || 'Failed to update customer')
+    }
+  }
+
+  const createCustomer = async (customerData) => {
+    try {
+      const res = await window.axios.post('/customers', customerData)
+
+      await fetchCustomers()
+    } catch (error) {
+      if (error.response?.status === 422) {
+        throw new Error('Validation error: ' + Object.values(error.response.data.errors).flat().join(', '))
+      }
+      throw new Error(error.response?.data?.message || 'Failed to save customer')
+    }
+  }
+
+  const deleteCustomer = async (customerId) => {
+    try {
+      await window.axios.delete(`/customers/${customerId}`)
+
+      await fetchCustomers()
+    } catch (error) {
+      throw new Error(error.response?.data?.message || 'Failed to delete customer')
+    }
+  }
+
+  const swapAccountNo = async (sourceCustomerId, targetCustomerId) => {
+    try {
+      await window.axios.post('/customers/swap-account-no', {
+        source_customer_id: sourceCustomerId,
+        target_customer_id: targetCustomerId,
+      })
+
+      await fetchCustomers()
+    } catch (error) {
+      if (error.response?.status === 422) {
+        throw new Error('Validation error: ' + Object.values(error.response.data.errors || {}).flat().join(', '))
+      }
+      throw new Error(error.response?.data?.message || 'Failed to swap account numbers')
+    }
+  }
+
+  const fetchCustomerTypes = async () => {
+    try {
+      const res = await fetch('/customer-types', {
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin',
+      })
+      if (res.ok) {
+        const json = await res.json()
+        customerTypes.value = Array.isArray(json?.data) ? json.data : []
+      }
+    } catch (e) {
+      console.error('Failed to fetch customer types', e)
+    }
+  }
+
+  const fetchBarangays = async () => {
+    try {
+      const res = await fetch('/barangays', {
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin',
+      })
+      if (res.ok) {
+        const json = await res.json()
+        barangays.value = Array.isArray(json?.data) ? json.data : []
+      }
+    } catch (e) {
+      console.error('Failed to fetch barangays', e)
+    }
+  }
+
+  const fetchDeductions = async () => {
+    try {
+      const res = await fetch('/deductions', {
+        headers: { 'Accept': 'application/json' },
+        credentials: 'same-origin',
+      })
+      if (res.ok) {
+        const json = await res.json()
+        deductions.value = Array.isArray(json?.data) ? json.data : []
+      }
+    } catch (e) {
+      console.error('Failed to fetch deductions', e)
+    }
+  }
+
+  return {
+    customers,
+    isLoading,
+    errorMessage,
+    search,
+    activeCount,
+    inactiveCount,
+    newCount,
+    filteredCustomers,
+    customerTypes,
+    barangays,
+    deductions,
+    fetchCustomers,
+    fetchCustomerTypes,
+    fetchBarangays,
+    fetchDeductions,
+    updateCustomer,
+    createCustomer,
+    deleteCustomer,
+    swapAccountNo
+  }
+}

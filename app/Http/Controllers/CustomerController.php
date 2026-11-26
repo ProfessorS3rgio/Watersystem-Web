@@ -1,0 +1,520 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Customer;
+use App\Models\BarangaySequence;
+use App\Models\Reading;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use App\Services\AuditLogService;
+use Illuminate\Support\Str;
+
+class CustomerController extends Controller
+{
+    /**
+     * Display a listing of the resource.
+     */
+    public function index(Request $request)
+    {
+        $accountNo = $request->query('account_no');
+        $name = $request->query('name');
+        $search = trim((string) $request->query('search', ''));
+        $status = $request->query('status');
+        $billState = $request->query('bill_state');
+        $brgyId = $request->query('brgy_id');
+        $updatedAfter = $request->query('updated_after');
+
+        $query = DB::table('customer')
+            ->leftJoin('customer_type as ct', 'ct.type_id', '=', 'customer.type_id')
+            ->leftJoin('deduction as d', 'd.deduction_id', '=', 'customer.deduction_id');
+        $query->leftJoin('customer_profiles as cp', 'cp.customer_id', '=', 'customer.customer_id');
+
+        if ($accountNo) {
+            $query->where('account_no', $accountNo);
+        }
+
+        if ($name) {
+            $query->where('customer_name', 'like', '%' . $name . '%');
+        }
+
+        if ($search !== '') {
+            $like = '%' . $search . '%';
+            $query->where(function ($sub) use ($like) {
+                $sub->where('customer.account_no', 'like', $like)
+                    ->orWhere('customer.customer_name', 'like', $like)
+                    ->orWhere('cp.meter_number', 'like', $like)
+                    ->orWhere('customer.address', 'like', $like)
+                    ->orWhere('ct.type_name', 'like', $like)
+                    ->orWhere('d.name', 'like', $like);
+            });
+        }
+
+        if ($status && in_array($status, ['active', 'disconnected'], true)) {
+            $query->where('customer.status', $status);
+        }
+
+        if ($brgyId) {
+            $query->where('brgy_id', $brgyId);
+        }
+
+        if ($updatedAfter) {
+            $query->where('customer.updated_at', '>', Carbon::createFromTimestamp($updatedAfter));
+        }
+
+        // Historical imports receive newer IDs. Choose the latest period,
+        // using the ID only to break ties within the same date.
+        $latestReading = DB::table('reading as candidate_reading')
+            ->select('candidate_reading.customer_id', 'candidate_reading.reading_id as latest_reading_id')
+            ->whereNotExists(function ($newer) {
+                $newer->selectRaw('1')->from('reading as newer_reading')
+                    ->whereColumn('newer_reading.customer_id', 'candidate_reading.customer_id')
+                    ->where(function ($date) {
+                        $date->whereColumn('newer_reading.reading_at', '>', 'candidate_reading.reading_at')
+                            ->orWhere(function ($tie) {
+                                $tie->whereColumn('newer_reading.reading_at', 'candidate_reading.reading_at')
+                                    ->whereColumn('newer_reading.reading_id', '>', 'candidate_reading.reading_id');
+                            });
+                    });
+            });
+
+        $latestBill = DB::table('bill as candidate_bill')
+            ->select('candidate_bill.customer_id', 'candidate_bill.bill_id as latest_bill_id')
+            ->whereNotExists(function ($newer) {
+                $newer->selectRaw('1')->from('bill as newer_bill')
+                    ->whereColumn('newer_bill.customer_id', 'candidate_bill.customer_id')
+                    ->where(function ($date) {
+                        $date->whereColumn('newer_bill.bill_date', '>', 'candidate_bill.bill_date')
+                            ->orWhere(function ($tie) {
+                                $tie->whereColumn('newer_bill.bill_date', 'candidate_bill.bill_date')
+                                    ->whereColumn('newer_bill.bill_id', '>', 'candidate_bill.bill_id');
+                            });
+                    });
+            });
+
+        $accountBalances = DB::table('bill')
+            ->select(
+                'customer_id',
+                // Paid bills should not contribute to outstanding balance even
+                // if an older synced row has a stale derived balance value.
+                DB::raw("SUM(CASE WHEN LOWER(status) NOT IN ('void', 'paid') THEN COALESCE(balance_due, total_due) ELSE 0 END) as account_balance")
+            )
+            ->groupBy('customer_id');
+
+        $customers = $query
+            ->leftJoinSub($latestReading, 'lr', function ($join) {
+                $join->on('lr.customer_id', '=', 'customer.customer_id');
+            })
+            ->leftJoin('reading as r', function ($join) {
+                $join->on('r.customer_id', '=', 'customer.customer_id')
+                    ->on('r.reading_id', '=', 'lr.latest_reading_id');
+            })
+            ->leftJoinSub($latestBill, 'lb', function ($join) {
+                $join->on('lb.customer_id', '=', 'customer.customer_id');
+            })
+            ->leftJoin('bill as b', function ($join) {
+                $join->on('b.customer_id', '=', 'customer.customer_id')
+                    ->on('b.bill_id', '=', 'lb.latest_bill_id');
+            })
+            ->leftJoinSub($accountBalances, 'ab', function ($join) {
+                $join->on('ab.customer_id', '=', 'customer.customer_id');
+            })
+            ->orderBy('customer.account_no')
+            ->get([
+                // alias primary key to `id` for frontend compatibility
+                'customer.customer_id as id',
+                'customer.account_no',
+                'customer.customer_name',
+                'customer.type_id',
+                'customer.deduction_id',
+                'customer.brgy_id',
+                'customer.address',
+                'customer.previous_reading',
+                'customer.status',
+                'customer.Synced',
+                'customer.last_sync',
+                'customer.created_at',
+                'customer.updated_at',
+                'cp.meter_number',
+                DB::raw("CASE WHEN cp.first_name IS NOT NULL AND cp.last_name IS NOT NULL THEN 1 ELSE 0 END as profile_manages_name"),
+                DB::raw('r.current_reading as current_reading'),
+                DB::raw('r.usage_m3 as last_usage_m3'),
+                DB::raw('r.reading_at as last_reading_at'),
+                DB::raw('b.bill_id as latest_bill_id'),
+                DB::raw('b.bill_date as latest_bill_date'),
+                DB::raw('b.due_date as latest_bill_due_date'),
+                DB::raw('b.total_due as latest_bill_total_due'),
+                DB::raw('b.amount_paid as latest_bill_amount_paid'),
+                DB::raw('b.balance_due as latest_bill_balance_due'),
+                DB::raw('b.status as latest_bill_status'),
+                DB::raw('COALESCE(ab.account_balance, 0) as account_balance'),
+            ]);
+
+        $today = Carbon::today();
+        $customers = $customers->map(function ($c) use ($today) {
+            $status = strtolower((string) ($c->latest_bill_status ?? ''));
+
+            $state = 'none';
+            if ($c->latest_bill_id) {
+                if ($status === 'paid') {
+                    $state = 'paid';
+                } else {
+                    $dueDate = $c->latest_bill_due_date ? Carbon::parse($c->latest_bill_due_date) : null;
+                    $state = ($dueDate && $dueDate->lessThan($today)) ? 'due' : 'pending';
+                }
+            }
+
+            $c->latest_bill_state = $state;
+            return $c;
+        });
+
+        if ($billState && in_array($billState, ['pending', 'due', 'paid', 'none'], true)) {
+            $customers = $customers
+                ->filter(fn ($c) => $c->latest_bill_state === $billState)
+                ->values();
+        }
+
+        return response()->json([
+            'data' => $customers,
+        ]);
+    }
+
+    /**
+     * Show the form for creating a new resource.
+     */
+    public function create()
+    {
+        //
+    }
+
+    /**
+     * Store a newly created resource in storage.
+     */
+    public function store(Request $request, AuditLogService $audit)
+    {
+        $validated = $request->validate([
+            'customer_name' => ['required', 'string', 'max:255'],
+            'type_id' => ['required', 'integer', 'exists:customer_type,type_id'],
+            'brgy_id' => ['required', 'integer', 'exists:barangay_sequence,brgy_id'],
+            'address' => ['required', 'string', 'max:255'],
+            'previous_reading' => ['nullable', 'integer', 'min:0'],
+            'status' => ['required', 'in:active,disconnected'],
+            'deduction_id' => ['nullable', 'integer', 'exists:deduction,deduction_id'],
+        ]);
+
+        $customer = DB::transaction(function () use ($validated, $audit) {
+            // Get barangay sequence and generate account number
+            $barangay = BarangaySequence::findOrFail($validated['brgy_id']);
+            $accountNo = $barangay->generateAccountNumber();
+
+            $customer = Customer::create([
+                'account_no' => $accountNo,
+                'customer_name' => $validated['customer_name'],
+                'type_id' => $validated['type_id'],
+                'deduction_id' => $validated['deduction_id'] ?? null,
+                'brgy_id' => $validated['brgy_id'],
+                'address' => $validated['address'],
+                'previous_reading' => array_key_exists('previous_reading', $validated) && $validated['previous_reading'] !== null
+                    ? $validated['previous_reading']
+                    : 0,
+                'status' => $validated['status'],
+                'Synced' => false,
+            ]);
+
+            // Increment the sequence
+            $barangay->incrementSequence();
+
+            // Attach deduction to customer_deduction table if provided
+            if (!empty($validated['deduction_id'])) {
+                $customer->deductions()->attach($validated['deduction_id']);
+            }
+
+            $audit->record('customer_created', $customer, null, $customer->getAttributes());
+            return $customer;
+        });
+
+        return response()->json([
+            'data' => $customer,
+        ], 201);
+    }
+
+    /**
+     * Bulk upsert customers coming from the device.
+     * Expects: { customers: [ {account_no, customer_name, address, previous_reading, is_active} ] }
+     */
+    public function sync(Request $request, AuditLogService $audit)
+    {
+        $validated = $request->validate([
+            'customers' => ['required', 'array', 'max:200'],
+            'customers.*.account_no' => ['required', 'string', 'max:255'],
+            'customers.*.customer_name' => ['required', 'string', 'max:255'],
+            'customers.*.address' => ['required', 'string', 'max:255'],
+            'customers.*.previous_reading' => ['nullable', 'integer', 'min:0'],
+            'customers.*.is_active' => ['nullable', 'boolean'],
+            'customers.*.type_id' => ['nullable', 'integer', 'exists:customer_type,type_id'],
+            'customers.*.deduction_id' => ['nullable', 'integer', 'exists:deduction,deduction_id'],
+            'customers.*.brgy_id' => ['nullable', 'integer', 'exists:barangay_sequence,brgy_id'],
+        ]);
+
+        $customers = $validated['customers'];
+        $processed = 0;
+
+        DB::transaction(function () use ($customers, &$processed, $audit) {
+        foreach ($customers as $row) {
+            Customer::where('account_no', $row['account_no'])->lockForUpdate()->first();
+            $deductionId = $row['deduction_id'] ?? null;
+            $customer = Customer::updateOrCreate(
+                ['account_no' => $row['account_no']],
+                [
+                    'customer_name' => $row['customer_name'],
+                    'address' => $row['address'],
+                    'previous_reading' => array_key_exists('previous_reading', $row) && $row['previous_reading'] !== null ? (int) $row['previous_reading'] : 0,
+                    'status' => array_key_exists('is_active', $row) ? ($row['is_active'] ? 'active' : 'disconnected') : 'active',
+                    'type_id' => $row['type_id'] ?? null,
+                    'deduction_id' => $deductionId,
+                    'brgy_id' => $row['brgy_id'] ?? null,
+                    'Synced' => true,
+                    'last_sync' => now(),
+                ]
+            );
+
+            // Sync deductions in customer_deduction table
+            if ($deductionId) {
+                $customer->deductions()->sync([$deductionId]);
+            } else {
+                $customer->deductions()->detach();
+            }
+
+            $processed++;
+        }
+
+        $audit->syncOperation('customers', count($customers), ['processed' => $processed]);
+        });
+
+        return response()->json([
+            'processed' => $processed,
+        ]);
+    }
+
+    /**
+     * Display the specified resource.
+     */
+    public function show(string $id)
+    {
+        //
+    }
+
+    /**
+     * Show the form for editing the specified resource.
+     */
+    public function edit(string $id)
+    {
+        //
+    }
+
+    /**
+     * Update the specified resource in storage.
+     */
+    public function update(Request $request, string $id, AuditLogService $audit)
+    {
+        $customer = Customer::findOrFail($id);
+
+        $validated = $request->validate([
+            'account_no' => ['required', 'string', 'max:255', 'unique:customer,account_no,' . $customer->customer_id . ',customer_id'],
+            'customer_name' => ['required', 'string', 'max:255'],
+            'type_id' => ['required', 'integer', 'exists:customer_type,type_id'],
+            'brgy_id' => ['required', 'integer', 'exists:barangay_sequence,brgy_id'],
+            'address' => ['required', 'string', 'max:255'],
+            'previous_reading' => ['nullable', 'integer', 'min:0'],
+            'current_reading' => ['nullable', 'integer', 'min:0'],
+            'status' => ['required', 'in:active,disconnected'],
+            'deduction_id' => ['nullable', 'integer', 'exists:deduction,deduction_id'],
+        ]);
+
+        $deductionId = $validated['deduction_id'] ?? null;
+
+        DB::transaction(function () use ($customer, $validated, $deductionId, $audit) {
+            Customer::whereKey($customer->customer_id)->lockForUpdate()->firstOrFail();
+            $customer->refresh();
+            $before = $customer->getAttributes();
+            $latestReading = Reading::where('customer_id', $customer->customer_id)
+                ->orderByDesc('reading_at')
+                ->orderByDesc('reading_id')
+                ->lockForUpdate()
+                ->first();
+
+            $previousReading = array_key_exists('previous_reading', $validated) && $validated['previous_reading'] !== null
+                ? (int) $validated['previous_reading']
+                : (int) $customer->previous_reading;
+            $currentReadingInput = $validated['current_reading'] ?? null;
+
+            if ($currentReadingInput !== null) {
+                if (!$latestReading) {
+                    throw \Illuminate\Validation\ValidationException::withMessages([
+                        'current_reading' => 'This customer does not have a reading record to update yet.',
+                    ]);
+                }
+
+                if ((int) $currentReadingInput < $previousReading) {
+                    throw \Illuminate\Validation\ValidationException::withMessages([
+                        'current_reading' => 'Present reading must be greater than or equal to the previous reading.',
+                    ]);
+                }
+            }
+
+            $customer->update([
+                'account_no' => $validated['account_no'],
+                'customer_name' => $validated['customer_name'],
+                'type_id' => $validated['type_id'],
+                'deduction_id' => $deductionId,
+                'brgy_id' => $validated['brgy_id'],
+                'address' => $validated['address'],
+                'previous_reading' => $previousReading,
+                'status' => $validated['status'],
+                'Synced' => false,
+                // Don't set last_sync to null for updated customers - keep previous sync time
+            ]);
+
+            if ($latestReading && $currentReadingInput !== null) {
+                $readingBefore = $latestReading->getAttributes();
+                $currentReading = (int) $currentReadingInput;
+                $latestReading->previous_reading = $previousReading;
+                $latestReading->current_reading = $currentReading;
+                $latestReading->usage_m3 = $currentReading - $previousReading;
+                $latestReading->customer_account_number = $validated['account_no'];
+                $latestReading->Synced = false;
+                $latestReading->save();
+                $audit->record('reading_updated', $latestReading, $readingBefore, $latestReading->getAttributes(), ['account_no' => $customer->account_no]);
+            }
+
+            // Sync deductions in customer_deduction table
+            if ($deductionId) {
+                $customer->deductions()->sync([$deductionId]);
+            } else {
+                $customer->deductions()->detach();
+            }
+            $action = ($before['status'] ?? null) === $customer->status ? 'customer_updated'
+                : ($customer->status === 'active' ? 'customer_reconnected' : 'customer_disconnected');
+            $audit->record($action, $customer, $before, $customer->getAttributes());
+        });
+
+        return response()->json([
+            'data' => $customer,
+        ]);
+    }
+
+    /**
+     * Swap account numbers between two customers.
+     */
+    public function swapAccountNo(Request $request, AuditLogService $audit)
+    {
+        $validated = $request->validate([
+            'source_customer_id' => ['required', 'integer', 'exists:customer,customer_id'],
+            'target_customer_id' => ['required', 'integer', 'different:source_customer_id', 'exists:customer,customer_id'],
+        ]);
+
+        return DB::transaction(function () use ($validated, $audit) {
+            $customers = Customer::whereIn('customer_id', [
+                $validated['source_customer_id'],
+                $validated['target_customer_id'],
+            ])->lockForUpdate()->get()->keyBy('customer_id');
+
+            $source = $customers->get($validated['source_customer_id']);
+            $target = $customers->get($validated['target_customer_id']);
+
+            if (!$source || !$target) {
+                return response()->json(['message' => 'Customer not found.'], 404);
+            }
+
+            $sourceAccount = $source->account_no;
+            $targetAccount = $target->account_no;
+            $before = ['source' => $source->getAttributes(), 'target' => $target->getAttributes()];
+
+            if ($sourceAccount === $targetAccount) {
+                return response()->json(['message' => 'Account numbers are already the same.'], 422);
+            }
+
+            $tempAccount = $this->generateTempAccountNo($sourceAccount, $source->customer_id);
+            while (Customer::where('account_no', $tempAccount)->exists()) {
+                $tempAccount = $this->generateTempAccountNo($sourceAccount, $source->customer_id);
+            }
+
+            $source->update([
+                'account_no' => $tempAccount,
+                'Synced' => false,
+            ]);
+
+            $target->update([
+                'account_no' => $sourceAccount,
+                'Synced' => false,
+            ]);
+
+            $source->update([
+                'account_no' => $targetAccount,
+                'Synced' => false,
+            ]);
+            $audit->record('customer_accounts_swapped', $source, $before, ['source' => $source->getAttributes(), 'target' => $target->getAttributes()], ['target_customer_id' => $target->customer_id, 'source_account_no' => $sourceAccount, 'target_account_no' => $targetAccount]);
+
+            return response()->json([
+                'data' => [
+                    'source_customer_id' => $source->customer_id,
+                    'target_customer_id' => $target->customer_id,
+                    'source_account_no' => $targetAccount,
+                    'target_account_no' => $sourceAccount,
+                ],
+            ]);
+        });
+    }
+
+    private function generateTempAccountNo(string $accountNo, int $customerId): string
+    {
+        $suffix = 'TMP-' . $customerId . '-' . Str::random(6);
+        $temp = $accountNo . '-' . $suffix;
+
+        if (strlen($temp) > 255) {
+            return 'TMP-' . $customerId . '-' . Str::random(10);
+        }
+
+        return $temp;
+    }
+
+    /**
+     * Mark customers as synced after successful device sync.
+     */
+    public function markSynced(Request $request)
+    {
+        $validated = $request->validate([
+            'account_numbers' => ['required', 'array'],
+            'account_numbers.*' => ['required', 'string', 'max:255'],
+        ]);
+
+        $updated = Customer::whereIn('account_no', $validated['account_numbers'])
+            ->update([
+                'Synced' => true,
+                'last_sync' => now(),
+            ]);
+
+        return response()->json([
+            'updated' => $updated,
+            'message' => "{$updated} customers marked as synced",
+        ]);
+    }
+
+    /**
+     * Remove the specified resource from storage.
+     */
+    public function destroy(string $id, AuditLogService $audit)
+    {
+        $customer = Customer::findOrFail($id);
+        DB::transaction(function () use ($customer, $audit) {
+            $before = $customer->getAttributes();
+            $customer->delete();
+            $audit->record('customer_deleted', $customer, $before, null);
+        });
+
+        return response()->json([
+            'message' => 'Customer deleted successfully',
+        ]);
+    }
+}
